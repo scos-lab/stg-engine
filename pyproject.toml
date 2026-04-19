@@ -1,0 +1,54 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "stg-engine"
+version = "0.3.0a1"
+description = "Semantic Tension Graph — cognitive memory system for AI agents (BSL 1.1, free for noncommercial use, commercial license required for businesses)"
+authors = [
+    { name = "wuko", email = "contact@stl-lang.org" }
+]
+license = { text = "BUSL-1.1" }
+license-files = ["LICENSE"]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "networkx>=3.0",
+    "numpy>=1.24",
+    "stl-parser>=1.9.0",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: Other/Proprietary License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+viz = ["plotly>=5.0"]
+dev = ["pytest>=7.0", "pytest-cov", "ruff", "maturin>=1.5"]
+
+[project.scripts]
+stg = "stg_engine.cli:main"
+
+[project.urls]
+Homepage = "https://stl-lang.org"
+Documentation = "https://stl-lang.org"
+Commercial-License = "https://stl-lang.org"
+
+[tool.maturin]
+# Tell maturin where the Rust crate lives
+manifest-path = "rust/Cargo.toml"
+# The Python source layout
+python-source = "."
+# Module name as imported from Python: stg_engine._rust_core
+module-name = "stg_engine._rust_core"
+# Build in release mode by default
+profile = "release"
+features = ["pyo3/extension-module"]
