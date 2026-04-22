@@ -96,8 +96,11 @@ import sys
 import os
 import json
 import logging
+import re
 import time
 from datetime import datetime
+from pathlib import Path
+from typing import Optional
 
 # --- Settings ---
 _CLI_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -898,17 +901,101 @@ def cmd_select(engine, args):
     print(f"Active context set ({len(result.selected_nodes)} nodes)")
 
 
+def _config_get_path(config: dict, dotted_key: str):
+    """Look up a dotted key in a nested config dict. Returns (value, found)."""
+    parts = dotted_key.split(".")
+    cur = config
+    for p in parts:
+        if not isinstance(cur, dict) or p not in cur:
+            return None, False
+        cur = cur[p]
+    return cur, True
+
+
+def _config_set_path(config: dict, dotted_key: str, value) -> None:
+    """Set a dotted key in a nested config dict, creating parents as needed."""
+    parts = dotted_key.split(".")
+    cur = config
+    for p in parts[:-1]:
+        nxt = cur.get(p)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[p] = nxt
+        cur = nxt
+    cur[parts[-1]] = value
+
+
+def _config_unset_path(config: dict, dotted_key: str) -> bool:
+    """Remove a dotted key. Returns True if deletion happened."""
+    parts = dotted_key.split(".")
+    cur = config
+    for p in parts[:-1]:
+        if not isinstance(cur, dict) or p not in cur:
+            return False
+        cur = cur[p]
+    if isinstance(cur, dict) and parts[-1] in cur:
+        del cur[parts[-1]]
+        return True
+    return False
+
+
+def _config_coerce_value(raw: str, hint: str = None):
+    """Coerce a raw CLI arg into a typed value based on the key hint.
+
+    - keys ending in '.roots' / 'roots'   → split on comma
+    - raw 'true' / 'false'                → bool
+    - raw that's all-digits (signed OK)   → int
+    - else                                → str
+    """
+    if hint and hint.endswith(".roots") or hint == "roots":
+        return [p.strip() for p in raw.split(",") if p.strip()]
+    s = raw.strip()
+    if s.lower() == "true":
+        return True
+    if s.lower() == "false":
+        return False
+    if s.lstrip("-").isdigit():
+        try:
+            return int(s)
+        except ValueError:
+            pass
+    return raw
+
+
+def _format_config_value(v) -> str:
+    if isinstance(v, list):
+        return ",".join(str(x) for x in v)
+    return str(v)
+
+
 def cmd_config(args):
     """User-level config (~/.stg/config.json) manipulation.
 
     Usage:
       stg config list                           — show all config keys
-      stg config get <key>                      — read one key
-      stg config set <key> <value>              — set one key
-      stg config unset <key>                    — remove one key
+      stg config get <key>                      — read one key (supports dotted paths)
+      stg config set <key> <value>              — set one key (supports dotted paths)
+      stg config unset <key>                    — remove one key (supports dotted paths)
+
+    Dotted keys nest into sub-objects. Examples:
+      stg config set skill.enabled true
+      stg config set skill.roots "/abs/path1,/abs/path2"
+      stg config set skill.interpreters.myvenv "/abs/path/to/python3"
+      stg config get skill.roots
+
+    Value coercion:
+      - "true" / "false" → boolean
+      - all-digits       → integer
+      - for keys ending in ".roots" or "roots" → comma-separated list
+      - else             → string
 
     Known keys:
-      default_agent    — agent name used when no --agent/STG_AGENT given
+      default_agent                     — agent name used when no --agent/STG_AGENT given
+      skill.enabled                     — bool, master switch for `stg use` (default: false)
+      skill.roots                       — list[str], whitelisted script path roots (default: [])
+      skill.interpreters.<name>         — str, absolute path to a named interpreter binary
+      skill.default_timeout_s           — int, fallback timeout when Skill edge doesn't specify (default: 60)
+      skill.output_cap_bytes            — int, max captured stdout (default: 10485760)
     """
     if not args:
         print(cmd_config.__doc__.strip())
@@ -922,14 +1009,22 @@ def cmd_config(args):
             print(f"(empty — {_USER_CONFIG_PATH} does not exist or has no keys)")
             return
         print(f"# {_USER_CONFIG_PATH}")
-        for k, v in config.items():
-            print(f"  {k} = {v!r}")
+        # Render flat: walk nested dicts into dotted keys
+        def _walk(prefix, node):
+            if isinstance(node, dict):
+                for k in sorted(node.keys()):
+                    _walk(prefix + [k], node[k])
+            else:
+                key = ".".join(prefix)
+                print(f"  {key} = {_format_config_value(node)!r}")
+        _walk([], config)
         return
 
     if sub == "get" and len(args) >= 2:
         key = args[1]
-        if key in config:
-            print(config[key])
+        value, found = _config_get_path(config, key)
+        if found:
+            print(_format_config_value(value))
         else:
             print(f"(unset) — would fall back to built-in default", file=sys.stderr)
             sys.exit(1)
@@ -937,16 +1032,16 @@ def cmd_config(args):
 
     if sub == "set" and len(args) >= 3:
         key = args[1]
-        value = args[2]
-        config[key] = value
+        raw = args[2]
+        value = _config_coerce_value(raw, hint=key)
+        _config_set_path(config, key, value)
         _write_user_config(config)
-        print(f"{key} = {value!r}  (saved to {_USER_CONFIG_PATH})")
+        print(f"{key} = {_format_config_value(value)!r}  (saved to {_USER_CONFIG_PATH})")
         return
 
     if sub == "unset" and len(args) >= 2:
         key = args[1]
-        if key in config:
-            del config[key]
+        if _config_unset_path(config, key):
             _write_user_config(config)
             print(f"unset {key}  (saved to {_USER_CONFIG_PATH})")
         else:
@@ -3276,6 +3371,345 @@ def cmd_perception(engine, args):
         print("  reset-filters      Re-initialize learnable filters")
 
 
+# ===========================================================================
+# Skill executor commands (v0.3.1+)
+# See development/design/STG_SKILL_EXECUTOR_DESIGN.md
+# ===========================================================================
+
+def cmd_use(engine, args):
+    """stg use <skill_name> [script_args...]
+
+    Execute a Skill node via its registered script. Requires:
+      - skill.enabled=true in user config (`stg config set skill.enabled true`)
+      - skill.roots whitelisting the script's directory
+      - executable=true modifier on the Skill edge
+
+    Flags (consumed by this command, not passed to the script):
+      --timeout N        override timeout seconds
+      --args-stl STL     pass an STL block via the script's stdin
+      --stdin STL        alias for --args-stl
+      --json             emit {stdout, stderr, exit_code, elapsed_s} as JSON
+      --dry-run          resolve + validate but don't execute
+    """
+    from stg_engine import skill_runner
+
+    if not args:
+        print(cmd_use.__doc__.strip())
+        sys.exit(skill_runner.EXIT_ENGINE_ERROR)
+
+    skill_name = args[0]
+    rest = list(args[1:])
+
+    timeout_override: Optional[int] = None
+    stdin_stl: Optional[str] = None
+    emit_json = False
+    dry_run = False
+
+    filtered: list = []
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok == "--timeout" and i + 1 < len(rest):
+            try:
+                timeout_override = int(rest[i + 1])
+            except ValueError:
+                print(f"invalid --timeout value: {rest[i+1]!r}", file=sys.stderr)
+                sys.exit(skill_runner.EXIT_ENGINE_ERROR)
+            i += 2
+            continue
+        if tok in ("--args-stl", "--stdin") and i + 1 < len(rest):
+            stdin_stl = rest[i + 1]
+            i += 2
+            continue
+        if tok == "--args-stl-file" and i + 1 < len(rest):
+            try:
+                stdin_stl = Path(rest[i + 1]).read_text()
+            except OSError as e:
+                print(f"cannot read --args-stl-file: {e}", file=sys.stderr)
+                sys.exit(skill_runner.EXIT_ENGINE_ERROR)
+            i += 2
+            continue
+        if tok == "--json":
+            emit_json = True
+            i += 1
+            continue
+        if tok == "--dry-run":
+            dry_run = True
+            i += 1
+            continue
+        filtered.append(tok)
+        i += 1
+
+    user_cfg = _read_user_config()
+
+    result = skill_runner.run_skill(
+        engine=engine,
+        skill_name=skill_name,
+        args=filtered,
+        user_config=user_cfg,
+        stdin_stl=stdin_stl,
+        timeout_override=timeout_override,
+        dry_run=dry_run,
+    )
+
+    # Write audit row (only for real attempts, not config-disabled)
+    if result.exit_code != skill_runner.EXIT_NOT_EXECUTABLE or result.path:
+        skill_runner.write_audit_row(STG_PATH, result)
+
+    if emit_json:
+        import json as _json
+        payload = {
+            "skill_name": result.skill_name,
+            "target": result.target,
+            "path": result.path,
+            "interpreter": result.interpreter,
+            "args": result.args,
+            "exit_code": result.exit_code,
+            "elapsed_s": result.elapsed_s,
+            "bytes_out": result.bytes_out,
+            "bytes_err": result.bytes_err,
+            "truncated": result.truncated_stdout,
+            "timed_out": result.timed_out,
+            "invocation_id": result.invocation_id,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "error": result.error,
+        }
+        print(_json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        if result.stdout:
+            sys.stdout.write(result.stdout)
+            if not result.stdout.endswith("\n"):
+                sys.stdout.write("\n")
+        if result.stderr:
+            sys.stderr.write(result.stderr)
+            if not result.stderr.endswith("\n"):
+                sys.stderr.write("\n")
+        if result.error:
+            print(f"error: {result.error}", file=sys.stderr)
+        if result.exit_code != 0:
+            tag = (
+                "[timeout]" if result.timed_out
+                else "[child-exit]" if result.exit_code == skill_runner.EXIT_CHILD_NONZERO
+                else "[error]"
+            )
+            print(f"\n{tag} skill={result.skill_name} "
+                  f"exit={result.exit_code} elapsed={result.elapsed_s:.2f}s",
+                  file=sys.stderr)
+
+    sys.exit(result.exit_code)
+
+
+def cmd_skill(engine, args):
+    """stg skill <subcommand> [...]
+
+    Subcommands:
+      list [--filter KEYWORD] [--all]   Catalog of skills
+      show <name>                       Full detail on one skill
+      use <name> [args...]              Alias for `stg use <name> [args...]`
+      configure <name> [--executable] [--interpreter NAME] [--args-template T] [--stl-io] [--timeout N]
+                                         Backfill invocation fields on an existing Skill edge
+      history [--skill N] [--limit N]   Recent invocations
+    """
+    from stg_engine import skill_runner
+
+    if not args:
+        print(cmd_skill.__doc__.strip())
+        return
+
+    sub = args[0]
+    rest = list(args[1:])
+
+    if sub == "list":
+        filter_kw: Optional[str] = None
+        show_all = False
+        i = 0
+        while i < len(rest):
+            tok = rest[i]
+            if tok == "--filter" and i + 1 < len(rest):
+                filter_kw = rest[i + 1]
+                i += 2
+                continue
+            if tok == "--all":
+                show_all = True
+                i += 1
+                continue
+            i += 1
+        skills = skill_runner.list_skills(
+            engine,
+            filter_keyword=filter_kw,
+            executable_only=not show_all,
+        )
+        print(skill_runner.render_catalog(skills))
+        return
+
+    if sub == "show" and rest:
+        name = rest[0]
+        edges = skill_runner.find_skill_edges_by_name(engine, name)
+        if not edges:
+            print(f"no Skill node named '{name}' found.")
+            sys.exit(skill_runner.EXIT_NOT_FOUND)
+        for u, v, data in edges:
+            from stg_engine.engine import _get_skill_invocation as _inv
+            inv = _inv(data)
+            print(f"Skill: {u}  →  {v}")
+            print(f"  confidence: {data.get('confidence', '?')}")
+            if data.get("rule"):
+                print(f"  rule:       {data.get('rule')}")
+            if data.get("description"):
+                print(f"  description: {data.get('description')}")
+            if data.get("path"):
+                print(f"  path:       {data.get('path')}")
+            for k in ("executable", "interpreter", "args_template",
+                      "stl_io", "timeout_s"):
+                if k in inv:
+                    print(f"  {k}: {inv[k]}")
+            print()
+        # Also show recent invocations
+        history = skill_runner.read_audit_history(STG_PATH, skill_name=name, limit=5)
+        if history:
+            print(f"Recent invocations (last {len(history)}):")
+            for row in history:
+                status = "ok" if row["exit_code"] == 0 else f"exit {row['exit_code']}"
+                import datetime as _dt
+                ts = _dt.datetime.fromtimestamp(row["timestamp"]).strftime("%Y-%m-%d %H:%M:%S")
+                print(f"  {ts}  [{status}]  {row['elapsed_s']:.2f}s  "
+                      f"args: {row['args_preview']}")
+        return
+
+    if sub == "use" and rest:
+        cmd_use(engine, rest)
+        return  # cmd_use calls sys.exit()
+
+    if sub == "configure" and rest:
+        _skill_configure(engine, rest)
+        return
+
+    if sub == "history":
+        filter_name: Optional[str] = None
+        limit = 20
+        i = 0
+        while i < len(rest):
+            tok = rest[i]
+            if tok == "--skill" and i + 1 < len(rest):
+                filter_name = rest[i + 1]
+                i += 2
+                continue
+            if tok == "--limit" and i + 1 < len(rest):
+                try:
+                    limit = int(rest[i + 1])
+                except ValueError:
+                    pass
+                i += 2
+                continue
+            i += 1
+        history = skill_runner.read_audit_history(
+            STG_PATH, skill_name=filter_name, limit=limit
+        )
+        if not history:
+            print("(no invocations recorded)")
+            return
+        import datetime as _dt
+        for row in history:
+            status = "ok" if row["exit_code"] == 0 else f"exit {row['exit_code']}"
+            ts = _dt.datetime.fromtimestamp(row["timestamp"]).strftime("%Y-%m-%d %H:%M:%S")
+            flags = []
+            if row["truncated"]: flags.append("truncated")
+            if row["timed_out"]: flags.append("timeout")
+            flag_s = f" [{','.join(flags)}]" if flags else ""
+            print(f"{ts}  {row['skill_name']:<35}  [{status}]  "
+                  f"{row['elapsed_s']:.2f}s{flag_s}  {row['args_preview']}")
+        return
+
+    print(cmd_skill.__doc__.strip())
+
+
+def _skill_configure(engine, args):
+    """Backfill invocation fields on an existing Skill edge via stg merge.
+
+    Usage:
+      stg skill configure <name> [--executable] [--no-executable]
+                                 [--interpreter NAME]
+                                 [--args-template STRING]
+                                 [--stl-io] [--no-stl-io]
+                                 [--timeout N]
+    """
+    from stg_engine import skill_runner
+
+    if not args:
+        print(_skill_configure.__doc__.strip())
+        return
+    name = args[0]
+    rest = args[1:]
+
+    fields: dict = {}
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok == "--executable":
+            fields["executable"] = "true"; i += 1
+        elif tok == "--no-executable":
+            fields["executable"] = "false"; i += 1
+        elif tok == "--interpreter" and i + 1 < len(rest):
+            fields["interpreter"] = rest[i + 1]; i += 2
+        elif tok == "--args-template" and i + 1 < len(rest):
+            fields["args_template"] = rest[i + 1]; i += 2
+        elif tok == "--stl-io":
+            fields["stl_io"] = "true"; i += 1
+        elif tok == "--no-stl-io":
+            fields["stl_io"] = "false"; i += 1
+        elif tok == "--timeout" and i + 1 < len(rest):
+            fields["timeout_s"] = rest[i + 1]; i += 2
+        else:
+            print(f"unknown flag: {tok}", file=sys.stderr)
+            sys.exit(skill_runner.EXIT_ENGINE_ERROR)
+
+    if not fields:
+        print("no fields given — see `stg skill configure --help`")
+        sys.exit(skill_runner.EXIT_ENGINE_ERROR)
+
+    edges = skill_runner.find_skill_edges_by_name(engine, name)
+    if not edges:
+        print(f"no Skill node named '{name}' found. Run `stg skill list` to see available skills.",
+              file=sys.stderr)
+        sys.exit(skill_runner.EXIT_NOT_FOUND)
+
+    if len(edges) > 1:
+        # Auto-pick the edge that has a `path` modifier — that's the primary
+        # "what this skill does" edge. Other edges (e.g. to a Lesson) are
+        # secondary and don't need invocation fields.
+        with_path = [e for e in edges if e[2].get("path")]
+        if len(with_path) == 1:
+            edges = with_path
+        else:
+            targets = [v for _, v, _ in edges]
+            with_paths = [v for _, v, d in edges if d.get("path")]
+            print(
+                f"'{name}' has {len(edges)} edges and no single one is the "
+                f"obvious primary (by path= modifier).\n"
+                f"  all targets:       {targets}\n"
+                f"  targets with path: {with_paths}\n"
+                f"Disambiguate with the full `stg merge` form specifying the target:\n"
+                f"  stg merge '[{name}] -> [TARGET] ::mod(executable=\"true\", ...)'",
+                file=sys.stderr,
+            )
+            sys.exit(skill_runner.EXIT_AMBIGUOUS)
+
+    # Build STL for merge
+    source, target, _ = edges[0]
+    mod_kv = ", ".join(f'{k}="{v}"' for k, v in fields.items())
+    stl_text = f'[{source}] -> [{target}] ::mod({mod_kv})'
+    cmd_merge(engine, stl_text)
+
+
+def cmd_skill_propagate_catalog(engine, query: str):
+    """When propagate query matches /^skills?$/i, render a catalog instead of
+    the usual community-grouped output."""
+    from stg_engine import skill_runner
+    skills = skill_runner.list_skills(engine, executable_only=False)
+    print(skill_runner.render_catalog(skills))
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -3368,6 +3802,16 @@ def main():
         cmd_tensions(engine, status)
     elif cmd == "propagate" and len(sys.argv) >= 3:
         args = sys.argv[2:]
+        # Short-circuit: `propagate skill` (or skills / SKILL / --namespace=Skill)
+        # renders the Skill catalog instead of the usual community-grouped view.
+        _catalog_trigger = False
+        if len(args) == 1 and re.match(r"^skills?$", args[0], re.IGNORECASE):
+            _catalog_trigger = True
+        if "--namespace=Skill" in args or "--namespace=skill" in args:
+            _catalog_trigger = True
+        if _catalog_trigger:
+            cmd_skill_propagate_catalog(engine, args[0] if args else "skill")
+            return
         # Gravity is ON by default (GP Phase 4). Use --no-gravity to disable.
         if "--no-gravity" in args:
             use_gravity = False
@@ -3676,6 +4120,10 @@ def main():
         cmd_perceive(engine, sys.argv[2:])
     elif cmd == "perception":
         cmd_perception(engine, sys.argv[2:])
+    elif cmd == "use" and len(sys.argv) >= 3:
+        cmd_use(engine, sys.argv[2:])
+    elif cmd == "skill":
+        cmd_skill(engine, sys.argv[2:])
     else:
         print(__doc__)
         sys.exit(1)

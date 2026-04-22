@@ -27,8 +27,11 @@ import networkx as nx
 if TYPE_CHECKING:
     from stg_engine.engine import STGEngine
 
-# Rust core (required)
-from stg_engine import _rust_core as _rust
+# Hot-path core: optional Rust, pure-Python fallback
+try:
+    from stg_engine import _rust_core as _rust
+except ImportError:
+    from stg_engine import _core_fallback as _rust
 
 
 @dataclass

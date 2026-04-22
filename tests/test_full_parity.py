@@ -197,7 +197,7 @@ def assert_updates_match(rust_updates, py_updates, tol=1e-5):
 
 def test_module_loads():
     print("\n[1] Module load + metadata")
-    assert _rust_core.__version__ == "0.2.0-alpha.1"
+    assert _rust_core.__version__ == "0.3.0-alpha.1"
     assert _rust_core.__license__ == "BUSL-1.1"
     assert hasattr(_rust_core, "propagate_inner_loop")
     assert hasattr(_rust_core, "hebbian_update")

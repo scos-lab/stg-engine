@@ -239,7 +239,64 @@ CREATE TABLE IF NOT EXISTS aliases (
     canonical TEXT NOT NULL,
     created_at REAL NOT NULL
 );
+
+-- Skill executor audit log (v0.3.1+): every `stg use` invocation records one row.
+-- Rolling cap enforced by skill_runner (keep last 10000).
+CREATE TABLE IF NOT EXISTS skill_invocations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    invocation_id TEXT NOT NULL,
+    timestamp REAL NOT NULL,
+    skill_name TEXT NOT NULL,
+    target TEXT,
+    path TEXT,
+    interpreter TEXT,
+    args_hash TEXT,
+    args_preview TEXT,
+    exit_code INTEGER NOT NULL,
+    elapsed_s REAL NOT NULL,
+    bytes_out INTEGER DEFAULT 0,
+    bytes_err INTEGER DEFAULT 0,
+    truncated INTEGER DEFAULT 0,
+    timed_out INTEGER DEFAULT 0,
+    error_msg TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_skill_inv_time ON skill_invocations(timestamp);
+CREATE INDEX IF NOT EXISTS idx_skill_inv_name ON skill_invocations(skill_name);
 """
+
+
+_SKILL_INVOCATIONS_MIGRATION_SQL = """
+CREATE TABLE IF NOT EXISTS skill_invocations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    invocation_id TEXT NOT NULL,
+    timestamp REAL NOT NULL,
+    skill_name TEXT NOT NULL,
+    target TEXT,
+    path TEXT,
+    interpreter TEXT,
+    args_hash TEXT,
+    args_preview TEXT,
+    exit_code INTEGER NOT NULL,
+    elapsed_s REAL NOT NULL,
+    bytes_out INTEGER DEFAULT 0,
+    bytes_err INTEGER DEFAULT 0,
+    truncated INTEGER DEFAULT 0,
+    timed_out INTEGER DEFAULT 0,
+    error_msg TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_skill_inv_time ON skill_invocations(timestamp);
+CREATE INDEX IF NOT EXISTS idx_skill_inv_name ON skill_invocations(skill_name);
+"""
+
+
+def _migrate_skill_invocations(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: add skill_invocations table if missing.
+
+    Called both on fresh init and on every load of an existing .stg that
+    predates v0.3.1. The CREATE TABLE IF NOT EXISTS makes this a no-op when
+    already present.
+    """
+    conn.executescript(_SKILL_INVOCATIONS_MIGRATION_SQL)
 
 
 def _init_db(conn: sqlite3.Connection) -> None:
@@ -786,6 +843,10 @@ def load_engine_state(path: str) -> Dict[str, Any]:
 
     conn = sqlite3.connect(str(stg_path))
     conn.row_factory = sqlite3.Row
+
+    # Apply idempotent migrations (v0.3.1+: skill_invocations)
+    _migrate_skill_invocations(conn)
+    conn.commit()
 
     result: Dict[str, Any] = {}
 

@@ -1,10 +1,10 @@
 [build-system]
-requires = ["maturin>=1.5,<2.0"]
-build-backend = "maturin"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "stg-engine"
-version = "0.3.0a1"
+version = "0.3.0a3"
 description = "Semantic Tension Graph — cognitive memory system for AI agents (BSL 1.1, free for noncommercial use, commercial license required for businesses)"
 authors = [
     { name = "wuko", email = "contact@stl-lang.org" }
@@ -26,13 +26,12 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
 [project.optional-dependencies]
 viz = ["plotly>=5.0"]
-dev = ["pytest>=7.0", "pytest-cov", "ruff", "maturin>=1.5"]
+dev = ["pytest>=7.0", "pytest-cov", "ruff"]
 
 [project.scripts]
 stg = "stg_engine.cli:main"
@@ -42,13 +41,43 @@ Homepage = "https://stl-lang.org"
 Documentation = "https://stl-lang.org"
 Commercial-License = "https://stl-lang.org"
 
-[tool.maturin]
-# Tell maturin where the Rust crate lives
-manifest-path = "rust/Cargo.toml"
-# The Python source layout
-python-source = "."
-# Module name as imported from Python: stg_engine._rust_core
-module-name = "stg_engine._rust_core"
-# Build in release mode by default
-profile = "release"
-features = ["pyo3/extension-module"]
+# ---------------------------------------------------------------------------
+# Packaging
+# ---------------------------------------------------------------------------
+# Pure-Python distribution. The repo contains an optional Rust acceleration
+# core under `rust/` — it is compiled locally for development via maturin but
+# is NOT shipped on PyPI during the alpha phase. The Python fallback inside
+# stg_engine is the default runtime path for PyPI users.
+#
+# If a developer builds the Rust extension locally, `stg_engine/_rust_core.so`
+# (or .pyd on Windows) will exist; the explicit excludes below keep it out of
+# both wheel and sdist.
+
+[tool.hatch.build.targets.wheel]
+packages = ["stg_engine"]
+exclude = [
+    "stg_engine/_rust_core*.so",
+    "stg_engine/_rust_core*.pyd",
+    "stg_engine/__pycache__",
+    "stg_engine/**/__pycache__",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/stg_engine",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/pyproject.toml",
+]
+exclude = [
+    "stg_engine/_rust_core*.so",
+    "stg_engine/_rust_core*.pyd",
+    "**/__pycache__",
+    ".pytest_cache",
+    "internal",
+    "rust",
+    "examples",
+    "tests",
+    "docs",
+]
