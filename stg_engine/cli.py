@@ -80,6 +80,26 @@ Multi-agent: use --agent <name> or STG_AGENT env var for isolated memory.
   import [manifest_path]                 Import from manifest file
   benchmark [full|propagation|...]       Performance benchmarks
 
+=== SKILLS (executable capabilities — v0.3.0a3+) ==========================
+
+  use <skill_name> [args...]             Run a registered Skill's script
+                                         with audit + timeout + STL I/O
+  skill list [--filter KW] [--all]       Catalog (executable skills first)
+  skill show <name>                      Detail + recent invocations
+  skill configure <name> --executable    Backfill invocation fields onto an
+      --interpreter <NAME|/abs>          existing Skill edge (uses `merge`)
+      --args-template '<sig>' [--timeout N] [--stl-io]
+  skill history [--skill N] [--limit N]  Recent stg use calls
+  propagate skill                        Render Skill catalog (instead of
+                                         community-grouped default)
+
+  One-time opt-in (disabled by default — fresh installs cannot run anything):
+      stg config set skill.enabled true
+      stg config set skill.roots "/abs/path/to/tools[,/abs/path/to/other]"
+      stg config set skill.interpreters.<name> "/abs/path/to/binary"
+
+  Full walkthrough + "how to make a skill" guide: run `stg guide`.
+
 === HEARTBEAT (contract execution) ========================================
 
   heartbeat run <dir> [--interval 10]    Execute contracts in directory
