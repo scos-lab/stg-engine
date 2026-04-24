@@ -70,7 +70,8 @@
 
 ## Related GitHub Issues
 
-- (Will be filled in when issues opened)
+- #1 — Packaging: `python3 -m stg_engine.cli` requires PYTHONPATH (Issue #2 from this log)
+- #2 — Propagate: natural-language queries return zero activation with no fallback (Issue #5 from this log)
 
 ---
 
