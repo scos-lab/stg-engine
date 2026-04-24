@@ -7,6 +7,9 @@ across sessions, recall it via associative activation, and learn automatically.
 Multi-agent: use --agent <name> or STG_AGENT env var for isolated memory.
   python stg_cli.py --agent my-agent stats
 
+Direct file path: use --path <file.stg> to load any .stg file (overrides --agent).
+  python stg_cli.py --path /tmp/external.stg stats
+
 === ESSENTIAL (start here) ================================================
 
   stats                                  Graph overview (nodes, edges, Ψ)
@@ -353,11 +356,15 @@ def cmd_import_doc(engine, filepath, source_type="doc", max_desc=10000):
     print(f"Graph: {s['node_count']} nodes, {s['edge_count']} edges")
 
 
-def cmd_grep(engine, pattern, limit=20):
+def cmd_grep(engine, pattern, limit=20, full=False):
     """Grep edges by description text, node names, and modifier values.
 
     Unlike query (node names only) and search (semantic embeddings),
     this does fast substring matching across all edge data.
+
+    Args:
+        full: if True, show full description (no 150-char truncation).
+              Default False preserves compact output for terminal use.
     """
     import re
     pat = re.compile(pattern, re.IGNORECASE)
@@ -394,7 +401,8 @@ def cmd_grep(engine, pattern, limit=20):
     print(f"Edges matching '{pattern}': {len(results)} (showing {min(limit, len(results))})")
     for e in results[:limit]:
         ts = e.modifiers.get("timestamp", "")
-        desc = e.modifiers.get("description", "")[:150]
+        raw_desc = e.modifiers.get("description", "")
+        desc = raw_desc if full else raw_desc[:150]
         ts_str = f"[{ts}] " if ts else ""
         comm = _community_label(engine, e.source)
         comm_suffix = f"  [{comm}]" if comm else ""
@@ -1015,6 +1023,7 @@ def cmd_config(args):
       skill.roots                       — list[str], whitelisted script path roots (default: [])
       skill.interpreters.<name>         — str, absolute path to a named interpreter binary
       skill.default_timeout_s           — int, fallback timeout when Skill edge doesn't specify (default: 60)
+      skill.max_timeout_s               — int, hard cap applied to any resolved timeout (default: 600)
       skill.output_cap_bytes            — int, max captured stdout (default: 10485760)
     """
     if not args:
@@ -1252,7 +1261,7 @@ def _is_virtual_edge(e):
     return "virtual_reason" in mods
 
 
-def _render_node_detail(engine, name, indent="", show_virtual=False):
+def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None):
     """Print full node detail with configurable indent.
 
     Extracted from cmd_node so community-mode propagate can inline
@@ -1261,6 +1270,9 @@ def _render_node_detail(engine, name, indent="", show_virtual=False):
     Virtual edges are filtered by default (show_virtual=False) — they are
     auto-generated structural bridges with no real description, and clutter
     the output. Count of hidden virtual edges is still reported.
+
+    If `limit` is set, only the first N edges in each direction are rendered
+    (useful for high-degree nodes like `Jesus` with 470+ real edges).
     """
     name, node = _resolve_node_name(engine, name)
     if not node:
@@ -1288,30 +1300,44 @@ def _render_node_detail(engine, name, indent="", show_virtual=False):
         out_virtual = len(out_edges_all) - len(out_edges)
         in_virtual = len(in_edges_all) - len(in_edges)
     mod_indent = pfx + "      "
+    out_shown = out_edges if limit is None else out_edges[:limit]
+    in_shown = in_edges if limit is None else in_edges[:limit]
+    out_truncated = len(out_edges) - len(out_shown)
+    in_truncated = len(in_edges) - len(in_shown)
     if out_edges:
-        print(f"\n{pfx}  Outgoing ({len(out_edges)}):")
-        for e in out_edges:
+        header = f"\n{pfx}  Outgoing ({len(out_edges)})"
+        if limit is not None and len(out_edges) > limit:
+            header += f" [showing {limit}]"
+        print(f"{header}:")
+        for e in out_shown:
             rule_str = f', rule="{e.rule}"' if e.rule else ""
             sal_str = f", sal={e.salience:.2f}" if abs(e.salience - e.confidence) > 0.01 else ""
             print(f"{pfx}    → [{e.target}] (c={e.confidence}, s={e.strength}{sal_str}{rule_str})")
             for line in _format_edge_modifiers(e, indent=mod_indent):
                 print(line)
+        if out_truncated:
+            print(f"{pfx}    (+ {out_truncated} more outgoing edge(s) truncated, raise --limit to show)")
     if out_virtual:
         print(f"{pfx}    (+ {out_virtual} virtual edge(s) hidden, use --virtual to show)")
     if in_edges:
-        print(f"\n{pfx}  Incoming ({len(in_edges)}):")
-        for e in in_edges:
+        header = f"\n{pfx}  Incoming ({len(in_edges)})"
+        if limit is not None and len(in_edges) > limit:
+            header += f" [showing {limit}]"
+        print(f"{header}:")
+        for e in in_shown:
             rule_str = f', rule="{e.rule}"' if e.rule else ""
             sal_str = f", sal={e.salience:.2f}" if abs(e.salience - e.confidence) > 0.01 else ""
             print(f"{pfx}    ← [{e.source}] (c={e.confidence}, s={e.strength}{sal_str}{rule_str})")
             for line in _format_edge_modifiers(e, indent=mod_indent):
                 print(line)
+        if in_truncated:
+            print(f"{pfx}    (+ {in_truncated} more incoming edge(s) truncated, raise --limit to show)")
     if in_virtual:
         print(f"{pfx}    (+ {in_virtual} virtual edge(s) hidden, use --virtual to show)")
 
 
-def cmd_node(engine, name, show_virtual=False):
-    _render_node_detail(engine, name, indent="", show_virtual=show_virtual)
+def cmd_node(engine, name, show_virtual=False, limit=None):
+    _render_node_detail(engine, name, indent="", show_virtual=show_virtual, limit=limit)
 
 
 def _save_last_ingest(new_nodes, candidates):
@@ -3776,6 +3802,10 @@ def main():
     elif cmd == "grep" and len(sys.argv) >= 3:
         args = sys.argv[2:]
         limit = 20
+        full = False
+        if "--full" in args:
+            full = True
+            args = [a for a in args if a != "--full"]
         if "--limit" in args:
             idx = args.index("--limit")
             if idx + 1 < len(args):
@@ -3784,7 +3814,7 @@ def main():
                 except ValueError:
                     pass
                 args = args[:idx] + args[idx + 2:]
-        cmd_grep(engine, " ".join(args), limit=limit)
+        cmd_grep(engine, " ".join(args), limit=limit, full=full)
     elif cmd == "dump":
         args = sys.argv[2:]
         page_size = 100
@@ -3906,8 +3936,17 @@ def main():
         node_args = sys.argv[2:]
         show_virtual = "--virtual" in node_args
         node_args = [a for a in node_args if a != "--virtual"]
+        limit = None
+        if "--limit" in node_args:
+            idx = node_args.index("--limit")
+            if idx + 1 < len(node_args):
+                try:
+                    limit = int(node_args[idx + 1])
+                except ValueError:
+                    pass
+                node_args = node_args[:idx] + node_args[idx + 2:]
         if node_args:
-            cmd_node(engine, node_args[0], show_virtual=show_virtual)
+            cmd_node(engine, node_args[0], show_virtual=show_virtual, limit=limit)
     elif cmd == "ingest" and len(sys.argv) >= 3:
         args = sys.argv[2:]
         cognitive = "--cognitive" in args
