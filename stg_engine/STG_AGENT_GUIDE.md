@@ -113,13 +113,39 @@ This prevents new nodes from being isolated endpoints. Use `--no-link` to skip c
 - Arrow `->` means "relates to" (directional)
 - `::mod(...)` attaches metadata
 
-**Always include:** `confidence` (0-1, how true) + `rule` (what type) + `description` (what it means)
+**Always include four things:**
+1. `confidence` (0-1, how true)
+2. `rule` (what kind of claim)
+3. `description` (what it means in plain language)
+4. **A meta semantic field** (what kind of relation — see below)
 
 **Rule types:**
 - `"definitional"` — X is defined as Y (confidence usually 0.95+)
 - `"causal"` — X causes Y (add `strength=0.8`)
 - `"empirical"` — learned from experience (add `lesson="what we learned"`)
 - `"logical"` — X implies Y through reasoning
+
+### Meta semantic fields — required, one per edge
+
+Every edge **must** carry at least one of these nine fields. They tell STG what *kind* of relation it is — not just metadata, but the edge's semantic spine. Empty-shell edges (description + confidence only, no semantic field) are bad ingest hygiene; choose the most specific field that fits.
+
+| Field | Use when the edge expresses... | Example value |
+|---|---|---|
+| `is_a` | classification, type membership | `is_a="scheduling_algorithm"` |
+| `action` | something happens / something causes / something does | `action="triggers"`, `action="took"` |
+| `role` | functional role one node plays for another | `role="mentor"`, `role="entry_point"` |
+| `status` | a state the source is in toward the target | `status="had_amazing_time"`, `status="deceased"` |
+| `phase` | temporal phase of a process | `phase="initialization"`, `phase="cleanup"` |
+| `relation` | generic relation (use only when nothing more specific fits) | `relation="depends_on"` |
+| `type`, `kind`, `predicate` | legacy synonyms, accepted but prefer `is_a` / `action` / `role` | — |
+
+**Rule of thumb when picking:**
+- "X *is* / *is a kind of* Y" → `is_a`
+- "X *does* / *causes* / *took* / *triggers* Y" → `action`
+- "X *plays role* in Y / *acts as* Y" → `role`
+- "X *is in state* Y / *enjoyed* Y / *failed at* Y" → `status`
+
+These fields are also what STG uses for **supersede detection** (see "Knowledge evolution" below). Two edges with the same source and same `(meta_semantic_field, value)` pointing at *different* targets is the only configuration that signals an actual correction.
 
 **Before ingesting:** Check if similar nodes already exist:
 ```bash
@@ -128,17 +154,25 @@ stg query "ConceptName"
 Reuse existing node names rather than creating new ones for the same concept.
 
 **Knowledge evolution (multi-edge):** You can ingest the same `[Source] -> [Target]` multiple times with different content. STG handles this automatically:
-- **Different content** (different description, confidence, rule, or strength) → both edges are kept. The old edge is marked as historical (`superseded_at`), the new edge becomes the active one used for propagation.
+- **Different content** (different description, confidence, rule, or strength) → both edges are kept and both stay active. They are treated as **complementary facets** of the same relationship, not as corrections. Lookup points to the newest, but propagation considers all of them.
 - **Identical content** → true duplicate, silently skipped.
 
-This means you don't need to worry about overwriting previous knowledge. STG preserves history:
 ```bash
-# Day 1: bug found
-stg ingest '[Auth_Module] -> [Login_Bug] ::mod(confidence=0.9, rule="empirical", description="login fails with special chars")'
-
-# Day 2: bug fixed — same nodes, different description → both kept
-stg ingest '[Auth_Module] -> [Login_Bug] ::mod(confidence=0.95, rule="empirical", description="fixed by escaping special chars in password handler")'
+# Two complementary facets of the same trip — both alive after ingest
+stg ingest '[User] -> [San_Francisco] ::mod(confidence=0.95, rule="empirical", action="took", description="User took a 5-day trip to SF on 2023-03-27")'
+stg ingest '[User] -> [San_Francisco] ::mod(confidence=0.95, rule="empirical", status="had_amazing_time", description="User reported having an amazing time during the trip")'
 ```
+
+**When does an edge get marked superseded?** Only when STG sees an actual **correction**: same source + same `(meta_semantic_field, value)` pair, but a **different target**. That's the only configuration that signals "the previous answer was wrong, here's the new one." Same-target multi-edges (above) are never auto-flagged — they coexist as facets.
+
+```bash
+# Real supersede — User had teacher A, then switched to teacher B (same field+value, different target)
+stg ingest '[User] -> [Teacher_A] ::mod(confidence=0.9, role="mentor", description="initial mentor")'
+stg ingest '[User] -> [Teacher_B] ::mod(confidence=0.9, role="mentor", description="new mentor as of 2026-04")'
+# → [User]->[Teacher_A] now carries suspected_supersede=True, superseded_by="Teacher_B"
+```
+
+Supersede is a **soft signal**, not ground truth: superseded edges aren't deleted, they're down-weighted by 0.3× in recall and frozen from Hebbian reinforcement. Your authoritative signal for "what's current" is still `occurred_time` plus the description content.
 
 **Memory consolidation (merge/consolidate) — restricted access:**
 
@@ -150,7 +184,7 @@ stg merge '[Auth_Module] -> [Login_Bug] ::mod(path="src/auth/login.py")'
 stg consolidate --all --dry-run
 stg consolidate --all
 ```
-Note: edges with different `timestamp` values are never merged (they represent different events).
+Note: edges with different `occurred_time` values are never merged (they represent different events).
 
 **Bulk ingest from file:**
 ```bash
@@ -253,7 +287,7 @@ Different kinds of knowledge form different kinds of communities. Knowing the ty
 | Type | What it contains | Ingest characteristics | Example community names |
 |------|-----------------|----------------------|------------------------|
 | **Book / Literature** | Knowledge decomposed from books or papers | High confidence, has `source`/DOI, stable over time | `sdm_hopfield_equivalence`, `kanerva_chapter_3` |
-| **News / Events** | Time-bound events, announcements | Has `timestamp`, may become stale, moderate confidence | `gpt_5_2_release`, `bushfire_season_2026` |
+| **News / Events** | Time-bound events, announcements | Has `occurred_time`, may become stale, moderate confidence | `gpt_5_2_release`, `bushfire_season_2026` |
 | **Daily life / Experience** | Personal episodes, routines | Episodic, time is primary axis, rich in `lesson` | Named by date or activity |
 | **Project** | Ongoing work with phases and milestones | Has status, evolves across sessions, crosses many topics | `website_factory`, `stl_bridge` |
 | **Theory / Concept** | Abstract frameworks, definitions | `rule="definitional"`, high confidence, referenced by other communities | `density_monism`, `epistemological_humility` |
@@ -264,14 +298,14 @@ Different kinds of knowledge form different kinds of communities. Knowing the ty
 
 **Why this matters for ingest:**
 - **Books/Theory**: decompose carefully, reuse concept nodes across chapters → forms one large community
-- **News**: always include `timestamp`, expect the community to grow as follow-up articles share nodes
-- **Daily life**: use dates in node names or `timestamp` modifier for temporal queries later
+- **News**: always include `occurred_time`, expect the community to grow as follow-up articles share nodes
+- **Daily life**: use dates in node names or `occurred_time` modifier for temporal queries later
 - **Projects**: reuse project-name nodes across sessions → all project work clusters automatically
 - **Skills**: use `Skill:` namespace prefix, include `path`/`cause`/`effect` so the knowledge is actionable
 
 **Why this matters for search:**
 - A result from a **theory** community is likely a stable definition — trust it
-- A result from a **news** community may be outdated — check the `timestamp`
+- A result from a **news** community may be outdated — check the `occurred_time`
 - A result from a **code** community in a conceptual query is probably noise — skip it
 - A result from a **project** community tells you this knowledge is work-related, not theoretical
 
@@ -361,6 +395,44 @@ stg node Car_Serviced_March_15
 - **propagate**: Best for "what do I know about this topic?" — gives you the neighborhood, not just matches. Also triggers Hebbian learning (strengthens recalled paths).
 - **search**: Best for "is there anything related to this concept?" — casts the widest net.
 - **converge**: Best for vague queries where a single propagation isn't enough.
+
+### Dual-anchor retrieval — propagate's "primary answer" mode
+
+When you know the **two specific nodes** the answer connects, drop them both into one `propagate` call. STG detects this and switches to a focused view that returns the answer in 3-6 lines instead of the usual 50-80.
+
+```bash
+# Single-bag propagate — returns ranked list, you scan it
+stg propagate "User volunteered Food For Thought charity"
+#   📍 exact anchors: [User, Charity_Events]
+#   ... 50-80 lines of node activations + edge previews ...
+
+# Dual-anchor propagate — when ≥2 query chunks exact-match canonical node names
+stg propagate "User Food_For_Thought_Charity_Gala"
+#   📍 exact anchors: [User, Food_For_Thought_Charity_Gala] (forced into result)
+#   🎯 Anchor-pair edges (1) — primary answer:
+#       [User] -[volunteer @2023-09-25]-> [Food_For_Thought_Charity_Gala]
+```
+
+**When dual-anchor triggers:** at least two query chunks (after token splitting) match canonical node names exactly. Underscore_or_NGram matching counts — a multi-word phrase like "Food For Thought" resolves to `Food_For_Thought_Charity_Gala` automatically (n-gram lookup, since 0.5.0a2). If only one chunk matches a node, the call falls back to single-bag propagate.
+
+**When to use which:**
+
+| Question shape | Use | Why |
+|---|---|---|
+| "When did User do X with EntityY?" / "How are User and EntityY connected?" | **Dual-anchor** (`propagate "User EntityY"`) | Direct edge between two known nodes, no ranking noise |
+| "What do I know about EntityY?" | Single-bag (`propagate "EntityY"`) | You want the neighborhood, not one specific edge |
+| "Aggregate / count / top-N" | Neither — use `node EntityY` and walk outgoing edges, or `temporal range` | Aggregation isn't a propagate task |
+| "Vague topic, no canonical node names yet" | Single-bag, then `select` good results | Let propagate explore |
+
+**Prerequisite: don't guess node names.** If you're not sure of the exact canonical name (`Samsung_Galaxy_S22` vs `User_Adrian_Smartphone_Samsung_Galaxy_S22`), run `query <pattern>` first to find the actual name, then dual-anchor with it. Wrong anchors → falls back to single-bag silently, you waste time.
+
+**Empirical signal:** on the 2026-04-28 LongMemEval 20-question benchmark, single-bag and dual-anchor both achieved 20/20 recall — but dual-anchor returned 3-6 lines per question vs single-bag's 50-80 (47-line average savings, 1-5s → 0.3-0.4s).
+
+### Edge-content scan covers all tokens (since 0.5.0a5)
+
+When you call `propagate "User volunteered participated charity events"`, STG now scans **every token** against edge `description` / `action` / `role`, not just the tokens that don't match a node name. This recovers the case where a token (e.g. `volunteered`) happens to match an unrelated concept node like `Volunteering_Best_Practices` and would otherwise hide the actual fact buried in some edge's `description="User volunteered at..."`. IDF weighting handles the noise — common tokens contribute less, rare tokens dominate. The edge containing the real fact will show up under `🪢 Event-edge matches` with `🔗 double-hit` marking.
+
+You don't need to do anything special — just write natural-language queries. The token-routing is automatic.
 
 ---
 
@@ -463,7 +535,7 @@ Not all content in an article is equally reliable. Calibrate confidence based on
 
 | Content type | Focus on extracting | Typical edges per article |
 |-------------|--------------------|----|
-| **News** | Events, actors, numbers, dates. Use `timestamp=` for event dates | 3-5 |
+| **News** | Events, actors, numbers, dates. Use `occurred_time=` for event dates | 3-5 |
 | **Blog/opinion** | Claims, arguments, cited evidence. Track `source=` to the author | 4-8 |
 | **Paper/abstract** | Theorems, results, methods, metrics. Use `source=` with DOI | 4-7 |
 | **Tutorial/how-to** | Procedures, dependencies, gotchas. Use `lesson=` for key takeaways | 3-6 |
@@ -743,6 +815,94 @@ capability by name."
 
 ---
 
+## STL Reference
+
+STL (Semantic Tension Language) is the wire format for ingesting knowledge into STG. The full specification lives at <https://github.com/scos-lab/semantic-tension-language>; this section is a working reference.
+
+### Statement shape
+
+```
+[Source] -> [Target] ::mod(key=value, key=value, ...)
+```
+
+- **Anchor**: `[Name]` — PascalCase, Underscore_Case, or native-language (CJK supported); valid chars `A-Za-z0-9_-:`; no spaces, no nesting.
+- **Namespace**: `[Project:Thing]` — colon separates namespace and name. Agents commonly use `Skill:`, `Memory:`, `Spec:`, `Lesson:`, `User:`, `Concept:`. One colon only — `[A:B:C]` is **not supported** by stl_parser; use a single namespace prefix.
+- **Arrow**: `->` (or `→`) — directional. `[A] -> [B]` ≠ `[B] -> [A]`.
+- **Modifier block**: `::mod(...)` — optional but in practice always required (you need at least confidence + a meta semantic field).
+
+Multiple `::mod()` blocks on one statement are allowed and merge. Multiple statements per file are allowed; one statement per line is the convention.
+
+### Modifier reference
+
+Modifiers fall into three tiers. Pick by purpose, not by alphabetical order.
+
+**Tier 1 — required on every edge**
+
+| Modifier | Type | Purpose |
+|---|---|---|
+| `confidence` | float 0-1 | How true the claim is. See calibration table below. |
+| One meta semantic field | string | What kind of relation: `is_a` / `action` / `role` / `status` / `phase` / `relation` / `type` / `kind` / `predicate`. See "Meta semantic fields" in §3. |
+
+**Tier 2 — strongly recommended**
+
+| Modifier | Type | Purpose |
+|---|---|---|
+| `description` | string | What this edge means in plain language. Without it, the edge is unreadable in 3 months. |
+| `rule` | enum | `"causal"` / `"empirical"` / `"definitional"` / `"logical"`. What kind of claim this is. |
+| `source` | string | Where the claim came from (URL, DOI, "wuko 2026-04-30", "session 042"). Required for high-confidence factual edges. |
+
+**Tier 3 — situational**
+
+| Modifier | Type | When to use |
+|---|---|---|
+| `strength` | float 0-1 | For `rule="causal"`: how strongly cause produces effect (independent of confidence). |
+| `lesson` | string | For `rule="empirical"`: the takeaway. Distinct from `description` (which is what happened). |
+| `path` | string | Pointer to a file: `path="/abs/path/to/spec.md"` or `path="src/auth.py:42"`. Used for STG-as-a-Pointer pattern. |
+| `cause` / `effect` | string | For causal edges, name the named cause/effect (auxiliary to source/target nodes). |
+| `domain` | string | Topic tag for filter/aggregate use. |
+| `author` | string | Who recorded this. |
+| `occurred_time` | datetime | When the event itself happened. See Timestamps section. |
+| `created_at` | float (epoch) | Override engine's auto-set ingest timestamp (for backfilled datasets). |
+| `certainty` | float 0-1 | Independent of confidence: agent's judgment of objective truth when the source is reliable but the content is doubtful (UserClaimed / CosmicTrace pattern). |
+
+**Skill-only modifiers** (see §Skills): `executable`, `interpreter`, `args_template`, `timeout_s`, `stl_io`. Don't put these on non-Skill edges.
+
+### Confidence calibration
+
+| Range | When to use |
+|---|---|
+| 0.95-1.0 | Definitional truth, mathematical fact, direct citation |
+| 0.85-0.94 | Strong-evidence factual claim, broadly accepted theory |
+| 0.70-0.84 | General knowledge, moderate evidence |
+| 0.50-0.69 | Possible but unconfirmed, limited evidence |
+| 0.30-0.49 | Speculative, weak evidence |
+| 0.00-0.29 | Highly uncertain, hypothetical |
+
+Subjective claims by users (e.g. "I had an amazing time", "meditation healed me") get **high confidence** (the source reliably reported it) plus **low certainty** (you doubt it's objectively true). For everyday factual content, just use confidence; certainty is for the corner case.
+
+### Three usage patterns for edges
+
+| Pattern | What lives where | Key modifiers |
+|---|---|---|
+| **STG-as-a-Pointer** | Detail is in a `.md` file; STG stores a one-line summary + path | `path=`, `description=` (one sentence) |
+| **STG-as-an-Event** | The full content fits on the edge | `description=` or `lesson=`, `occurred_time=`, `rule="empirical"` |
+| **STG-as-a-Skill** | Edge is an executable script registration | `path=`, `executable="true"`, `interpreter=`, `args_template=`, `timeout_s=` (see §Skills) |
+
+Threshold: if your content is more than 2-3 sentences → write a `.md`, store the path. If a single `lesson=` clause says it → keep it on the edge. If it's a runnable operation → make it a Skill.
+
+### Validation
+
+Before ingesting a batch, validate the syntax. The `stl` CLI (sibling tool, `pip install stl-parser`) provides:
+
+```bash
+stl validate path/to/extracted.stl     # syntax check
+stl parse path/to/extracted.stl        # parse + show structure
+```
+
+Avoid pre-commit shortcuts that skip validation — invented `action` values and missing required modifiers slip through and pollute the graph.
+
+---
+
 ## Temporal Queries (What happened when?)
 
 Every edge in STG has a `created_at` timestamp. You can use this to look back in time — what was learned on a specific day, what happened around a specific concept, and reconstruct the sequence of thought.
@@ -819,28 +979,35 @@ stg temporal replay <start_node>
 - **Ψ (Psi)** = knowledge quality metric. Measures confidence distribution and structural coherence.
 - **Pruning** = automatic removal of low-salience, long-unused, structurally unimportant edges. Triple-safety prevents removing critical connections.
 
-### Timestamps — Every Edge Has Two
+### Timestamps — Two Layers, Clear Separation
 
-Each edge carries two timestamps automatically:
+STG separates "when the edge was written" from "when the event happened". Two layers, two responsibilities:
 
-| Timestamp | What it records | Set by |
-|-----------|----------------|--------|
-| **`created_at`** | When the edge was first written to the graph | Engine (automatic, at ingest time) |
-| **`last_used`** | When the edge was last activated by Hebbian learning | Engine (automatic, during propagation) |
-
-These drive two core mechanisms:
-- **Time decay**: salience decays based on `now - last_used`. Frequently used edges stay salient; unused edges fade. Half-life = 30 days.
-- **Temporal queries**: `temporal range <date>` uses `created_at` to show what was ingested when.
-
-You can also set a **semantic timestamp** via modifiers — when the *event itself* occurred (as opposed to when it was recorded):
+| Layer | Field | What it records | Set by |
+|---|---|---|---|
+| **Engine** | `created_at` | When this edge was written to the graph (epoch float) | Engine, automatic at ingest |
+| **Engine** | `last_used` | When the edge was last activated during propagation | Engine, automatic during recall |
+| **Semantic** | `occurred_time` | When the event itself happened (recommended field) | You, via modifier |
 
 ```bash
-stg ingest '[Server_Outage] -> [Root_Cause_OOM] ::mod(confidence=0.95, rule="empirical", timestamp="2026-03-15T14:30:00", description="OOM killed the API server during traffic spike")'
+stg ingest '[Server_Outage] -> [Root_Cause_OOM] ::mod(action="caused_by", confidence=0.95, rule="empirical", occurred_time="2026-03-15T14:30:00", description="OOM killed the API server during traffic spike")'
 ```
 
-| Modifier | What it records | Set by |
-|----------|----------------|--------|
-| `timestamp` | When the event happened (e.g., "outage at 14:30") | You (manual) |
-| `recorded_at` | Conceptual — exists to clarify that `created_at` = ingest time | Not implemented in code |
+**Use `occurred_time`, not `timestamp`.** The old field name `timestamp` was ambiguous — it could mean "event time" *or* "record time" — and is the documented source of LongMemEval ingest fallback bugs (LLMs sometimes filled it with the session timestamp instead of the real event time). `timestamp` is still accepted as a deprecated alias for backward compatibility, but new ingests should use `occurred_time`. The `_time` noun suffix is unambiguous in zero-context LLM use; the `_at` preposition was easy to mis-fill.
 
-Don't confuse these: `created_at` is engine-level (when `add_edge()` ran), `timestamp` is semantic-level (optional, for event dating). `recorded_at` is conceptual only — it clarifies that `created_at` means "ingest time", not "when the knowledge was originally recorded".
+**`recorded_at` is gone — merged into `created_at`.** Earlier docs talked about a `recorded_at` field; it was conceptual only and has been folded into `created_at`. Don't write `recorded_at` in new edges.
+
+**Override `created_at` for backfilled ingests.** When ingesting an external dataset where each piece of knowledge has its own original recording time (e.g., conversation logs with dates, archived emails), pass a `created_at=<float>` modifier to override the default ingest time:
+
+```bash
+# This edge will show as if it were recorded on 2023-09-25 13:45 UTC,
+# not at the moment of ingest. Useful for replaying datasets while
+# preserving their authentic temporal signature.
+stg ingest '[User] -> [Charity_Gala] ::mod(action="volunteered", confidence=0.95, occurred_time="2023-09-25", created_at=1695645900.0, description="...")'
+```
+
+These drive two recall mechanisms:
+- **Time decay** — salience decays based on `now - last_used`. Half-life = 30 days. Unused edges fade.
+- **Temporal queries** — `temporal range <date>` reads `created_at` (ingest/replay time), not `occurred_time` (event time). Use `occurred_time` filters in `propagate` / `node` output to find by event date.
+
+Don't confuse: `created_at` is **always present, always engine-set** (or modifier-overridden during backfill). `occurred_time` is **optional, always you-set** for events with real dates. `last_used` is engine bookkeeping for Hebbian decay.

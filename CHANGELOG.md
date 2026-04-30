@@ -4,6 +4,42 @@ All notable changes to STG Engine are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Documentation — STG_AGENT_GUIDE.md major revision
+
+The agent-facing guide (`stg guide`) was several versions behind the engine. Audited against 0.5.0a6 behavior and updated:
+
+- **Multi-edge supersede semantics rewritten** — the old text described the
+  pre-0.5.0a6 Path-1 behavior ("old edge marked superseded, new becomes
+  active"). Replaced with the current Path-2-only model: same (src,tgt)
+  multi-edges coexist as complementary facets; supersede flags only fire
+  on same source + same `(meta_field, value)` + DIFFERENT target.
+- **New "Meta semantic fields — required, one per edge" subsection** —
+  documents the nine SEMANTIC_FIELDS (`is_a`, `action`, `role`, `status`,
+  `phase`, `relation`, plus the legacy `type`/`kind`/`predicate`), how to
+  pick the most specific one, and that they are what drives supersede
+  detection. Bumps the "always include" count from 3 to 4.
+- **Timestamps section rewritten** — `timestamp=` → `occurred_time=` (the
+  old name was ambiguous and a known LongMemEval ingest-fallback
+  source). Documents the modifier-level `created_at` override for
+  backfilled external dataset ingests. Drops the "recorded_at not
+  implemented" line — that field is gone, merged into `created_at`.
+- **New "Dual-anchor retrieval" subsection** — documents the 0.5.0a1
+  retrieval mode: query containing ≥2 chunks that exact-match canonical
+  node names triggers the focused 🎯 Anchor-pair view (3-6 lines vs the
+  ranked-list 50-80). Includes the n-gram matching note (0.5.0a2: "Food
+  For Thought" → `Food_For_Thought_Charity_Gala`) and the all-token
+  edge-content scan (0.5.0a5).
+- **New "STL Reference" top-level section** — three-tier modifier table
+  (required / recommended / situational), namespace syntax, confidence
+  calibration table, the three usage patterns (Pointer / Event / Skill),
+  pointer to the external STL spec, and a `stl validate` mention.
+
+Net change: 846 → 1013 lines, +196/-29.
+
+---
+
 ## [0.5.0a6] — 2026-04-30
 
 ### Fixed — `superseded_at` no longer fires on complementary multi-edges
