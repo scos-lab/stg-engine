@@ -167,6 +167,40 @@ Full CLI reference: `stg --help`
 
 ---
 
+## Precision recall (default in 0.4+)
+
+`stg propagate` does more than spread activation — it now **converges**.
+Four cooperating mechanisms sharpen retrieval without ever filtering an
+edge:
+
+| Mechanism | What it does | When it fires |
+|-----------|--------------|---------------|
+| **R1** Recency × supersede soft weight | Older / superseded edges get softly down-weighted (default 30-day half-life, supersede factor 0.3) | Every propagate |
+| **R2** Multi-seed chain intersection | Each query token runs through propagate separately; output is the node intersection across each token's reconstructed chains | When ≥2 query tokens hit node names |
+| **R5** active_context anchor | Nodes from your last `stg select` get a temporary +5.0 elevation boost, pulling propagate energy toward your current focus | When `active_context` is non-empty (TTL 30 min) |
+| **R6** Edge-as-fallback-seed | Tokens that match no node name fall through to scan edge `description`/`lesson`/`action`/`role`/`status`/`is_a`. Returns event edges as a separate "Event-edge" view | When ≥1 query token misses all node names |
+| **R7** Community dominance ratio | Communities scoring below `dominant/3.0` are folded out — except those containing precise query hits, which are always preserved | Every propagate (community mode) |
+
+The **memory-never-vanishes** principle is hard-coded: superseded edges
+are softly down-weighted, never deleted. Recall completeness is preserved
+across all four mechanisms — they shape ranking, not membership.
+
+Disable any mechanism via flag (rarely needed):
+
+```bash
+stg propagate "your query"                          # default — all five ON
+stg propagate "your query" --no-recency-weight      # disable R1
+stg propagate "your query" --no-multi-seed          # disable R2
+stg propagate "your query" --no-context-anchor      # disable R5
+stg propagate "your query" --no-edge-fallback       # disable R6
+stg propagate "your query" --no-community-filter    # disable R7
+stg propagate "your query" --legacy                 # all five OFF (pre-0.4)
+```
+
+Full design: see `STG_PRECISION_RECALL_DESIGN.md`.
+
+---
+
 ## Skills: turning Skill nodes into runnable commands
 
 Skill-namespaced nodes (`Skill:SomeName`) can be registered as **executable**

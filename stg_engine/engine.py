@@ -516,7 +516,13 @@ class STGEngine:
         # If (source, target) already exists:
         #   - Semantically identical: true duplicate, skip (return existing)
         #   - Different content: allow multi-edge (knowledge evolution)
-        #     Old edge stays in _edges list, lookup points to newest
+        #     Old edge stays in _edges list, lookup points to newest.
+        # Note: supersede flagging is NOT done here — same (src,tgt) edges
+        # often carry complementary semantic facets (e.g. action="took" vs
+        # status="had_amazing_time"), not corrections. Supersede is detected
+        # exclusively by _flag_suspected_supersede() below, which requires
+        # same (semantic_field, value) but DIFFERENT target — the only
+        # configuration that signals an actual correction.
         existing_edge = self._edges_lookup.get((_src, _tgt))
         if existing_edge and existing_edge.modifiers.get("edge_class") != "virtual":
             # Check if new edge is semantically identical to existing
@@ -530,11 +536,9 @@ class STGEngine:
             if is_true_duplicate:
                 # True duplicate — no new information, skip
                 return existing_edge
-            else:
-                # Knowledge evolution — allow multi-edge
-                # Mark old edge as superseded, keep in _edges for history
-                existing_edge.modifiers["superseded_at"] = created_at or _time.time()
-                # Fall through to create new edge; lookup will point to it
+            # Otherwise fall through to create new edge; lookup will point to it.
+            # No supersede flag — let _flag_suspected_supersede decide based on
+            # actual semantic conflict (same field+value, different target).
 
         edge = STGEdge(
             source=_src_dn,  # display name on edge (user-facing)

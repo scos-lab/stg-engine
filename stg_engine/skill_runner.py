@@ -61,7 +61,7 @@ BUILTIN_INTERPRETERS: Tuple[str, ...] = (
 # --- Defaults (used when user config hasn't set a value) -------------------
 DEFAULT_TIMEOUT_S = 60
 DEFAULT_OUTPUT_CAP = 10 * 1024 * 1024  # 10 MB
-MAX_TIMEOUT_S = 600  # hard cap even if user config says more
+MAX_TIMEOUT_S = 600  # default hard cap; can be raised via `skill.max_timeout_s` user config
 
 
 # =============================================================================
@@ -326,7 +326,8 @@ def invoke_skill(
     declared_timeout = inv.get("timeout_s")
     default_timeout = int(skill_cfg.get("default_timeout_s") or DEFAULT_TIMEOUT_S)
     timeout_s = timeout_override or declared_timeout or default_timeout
-    timeout_s = max(1, min(int(timeout_s), MAX_TIMEOUT_S))
+    max_cap = int(skill_cfg.get("max_timeout_s") or MAX_TIMEOUT_S)
+    timeout_s = max(1, min(int(timeout_s), max_cap))
 
     # Resolve output cap
     cap = output_cap or int(skill_cfg.get("output_cap_bytes") or DEFAULT_OUTPUT_CAP)
