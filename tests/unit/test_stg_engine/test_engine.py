@@ -192,13 +192,19 @@ class TestDuplicateEdgePrevention:
         assert len(engine.get_edges()) == 1
 
     def test_different_confidence_creates_multi_edge(self):
-        """Different confidence → multi-edge, old superseded."""
+        """Different confidence → multi-edge, both alive (no auto-supersede).
+
+        Same (src,tgt) edges are treated as complementary facets, not
+        corrections. Supersede is the job of _flag_suspected_supersede,
+        which fires only on same field+value + DIFFERENT target.
+        """
         engine = STGEngine()
         edge1 = engine.add_edge("A", "B", confidence=0.5)
         edge2 = engine.add_edge("A", "B", confidence=0.9)
         assert edge1 is not edge2
         assert len(engine._edges) == 2
-        assert edge1.modifiers.get("superseded_at") is not None
+        assert edge1.modifiers.get("superseded_at") is None
+        assert edge1.modifiers.get("suspected_supersede") is None
         # Lookup points to newest
         assert engine._edges_lookup[("a", "b")] is edge2
 

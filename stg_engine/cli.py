@@ -7,6 +7,9 @@ across sessions, recall it via associative activation, and learn automatically.
 Multi-agent: use --agent <name> or STG_AGENT env var for isolated memory.
   python stg_cli.py --agent my-agent stats
 
+Direct file path: use --path <file.stg> to load any .stg file (overrides --agent).
+  python stg_cli.py --path /tmp/external.stg stats
+
 === ESSENTIAL (start here) ================================================
 
   stats                                  Graph overview (nodes, edges, Ψ)
@@ -40,8 +43,11 @@ Multi-agent: use --agent <name> or STG_AGENT env var for isolated memory.
   Recommended: rule ("causal"/"empirical"/"definitional"/"logical")
   Optional:    strength (0-1), lesson ("..."), timestamp ("2026-03-29"), source ("...")
 
-  Multi-edge: same (Source, Target) with different content → both kept.
-    Old edge marked superseded, new edge becomes active. History preserved.
+  Multi-edge: same (Source, Target) with different content → both kept,
+    both alive. Treated as complementary facets (e.g. action="took" and
+    status="had_amazing_time" describe the same trip). Lookup points to
+    newest. Supersede is flagged only on actual corrections: same source
+    + same (semantic_field, value) + DIFFERENT target.
 
   Timestamps: each edge has created_at (auto, when ingested) and
     last_used (auto, when Hebbian-activated). Use timestamp= in mod
@@ -80,6 +86,26 @@ Multi-agent: use --agent <name> or STG_AGENT env var for isolated memory.
   import [manifest_path]                 Import from manifest file
   benchmark [full|propagation|...]       Performance benchmarks
 
+=== SKILLS (executable capabilities — v0.3.0a3+) ==========================
+
+  use <skill_name> [args...]             Run a registered Skill's script
+                                         with audit + timeout + STL I/O
+  skill list [--filter KW] [--all]       Catalog (executable skills first)
+  skill show <name>                      Detail + recent invocations
+  skill configure <name> --executable    Backfill invocation fields onto an
+      --interpreter <NAME|/abs>          existing Skill edge (uses `merge`)
+      --args-template '<sig>' [--timeout N] [--stl-io]
+  skill history [--skill N] [--limit N]  Recent stg use calls
+  propagate skill                        Render Skill catalog (instead of
+                                         community-grouped default)
+
+  One-time opt-in (disabled by default — fresh installs cannot run anything):
+      stg config set skill.enabled true
+      stg config set skill.roots "/abs/path/to/tools[,/abs/path/to/other]"
+      stg config set skill.interpreters.<name> "/abs/path/to/binary"
+
+  Full walkthrough + "how to make a skill" guide: run `stg guide`.
+
 === HEARTBEAT (contract execution) ========================================
 
   heartbeat run <dir> [--interval 10]    Execute contracts in directory
@@ -96,8 +122,11 @@ import sys
 import os
 import json
 import logging
+import re
 import time
 from datetime import datetime
+from pathlib import Path
+from typing import Optional
 
 # --- Settings ---
 _CLI_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -330,11 +359,15 @@ def cmd_import_doc(engine, filepath, source_type="doc", max_desc=10000):
     print(f"Graph: {s['node_count']} nodes, {s['edge_count']} edges")
 
 
-def cmd_grep(engine, pattern, limit=20):
+def cmd_grep(engine, pattern, limit=20, full=False):
     """Grep edges by description text, node names, and modifier values.
 
     Unlike query (node names only) and search (semantic embeddings),
     this does fast substring matching across all edge data.
+
+    Args:
+        full: if True, show full description (no 150-char truncation).
+              Default False preserves compact output for terminal use.
     """
     import re
     pat = re.compile(pattern, re.IGNORECASE)
@@ -371,7 +404,8 @@ def cmd_grep(engine, pattern, limit=20):
     print(f"Edges matching '{pattern}': {len(results)} (showing {min(limit, len(results))})")
     for e in results[:limit]:
         ts = e.modifiers.get("timestamp", "")
-        desc = e.modifiers.get("description", "")[:150]
+        raw_desc = e.modifiers.get("description", "")
+        desc = raw_desc if full else raw_desc[:150]
         ts_str = f"[{ts}] " if ts else ""
         comm = _community_label(engine, e.source)
         comm_suffix = f"  [{comm}]" if comm else ""
@@ -563,6 +597,29 @@ def _log_propagate(engine, text, elapsed):
         pass  # logging should never break propagate
 
 
+def _format_edge_label(edge):
+    """Compact edge label using meta semantic fields with fallback chain.
+
+    Picks the first non-empty value from action / role / status / phase /
+    is_a / relation, and appends @occurred_time / @timestamp if present.
+    Used by anchor-pair and event-edge views to surface relationship type
+    even when `action` is missing (common in human-curated graphs).
+    """
+    mods = edge.modifiers
+    semantic = (
+        mods.get("action") or mods.get("role") or mods.get("status")
+        or mods.get("phase") or mods.get("is_a") or mods.get("relation")
+        or ""
+    )
+    when = mods.get("occurred_time") or mods.get("timestamp") or ""
+    parts = []
+    if semantic:
+        parts.append(str(semantic))
+    if when:
+        parts.append(f"@{when}")
+    return " ".join(parts) if parts else "→"
+
+
 def _show_propagation_chains(engine, activated, max_chains=5, min_length=2, all_chains=False, all_modifiers=False):
     """Extract and display chains from the activated subgraph.
 
@@ -726,23 +783,162 @@ def _community_label(engine, node_name, resolution="medium"):
         return ""
 
 
-def cmd_propagate(engine, text, use_gravity=False, resolution="medium", all_chains=False, all_modifiers=False, expand_top=3, community_mode=True, top_m=5, brief=False, show_virtual=False):
+def cmd_propagate(engine, text, use_gravity=False, resolution="medium", all_chains=False, all_modifiers=False, expand_top=3, community_mode=True, top_m=5, brief=False, show_virtual=False,
+                  no_recency_weight=False, no_community_filter=False,
+                  no_context_anchor=False, no_multi_seed=False,
+                  no_edge_fallback=False):
     # Auto-enable Hebbian learning on every propagate
     engine.enable_learning()
     engine.enable_telemetry()
 
+    # ─── Phase 2: R5 active_context anchor (gravity elevation boost) ─
+    # Load active_context with TTL filter; temporarily boost their
+    # elevation in the GravityMap during propagate. Restored in finally.
+    # See development/design/STG_PRECISION_RECALL_DESIGN.md §4.5
+    from contextlib import nullcontext
+    anchor_ctx = nullcontext()
+    anchor_names: list = []
+    if use_gravity and not no_context_anchor:
+        from stg_engine.feedback_select import load_active_context
+        from stg_engine.recall import (
+            context_anchor_boost,
+            DEFAULT_ACTIVE_CONTEXT_TTL_SECONDS,
+        )
+        ctx = load_active_context(STG_PATH, ttl_seconds=DEFAULT_ACTIVE_CONTEXT_TTL_SECONDS)
+        anchor_names = [name for name, _ in ctx]
+        if anchor_names:
+            gravity_for_anchor = engine.get_gravity_map()
+            anchor_ctx = context_anchor_boost(gravity_for_anchor, anchor_names)
+
+    # ─── Phase 3: R2 multi-seed chain intersection dispatch ──────────
+    # Split query into tokens. ≥2 tokens → run wrapped multi-seed path
+    # (one propagate per token + chain-intersection rerank). Otherwise
+    # fall through to single-seed path.
+    # See STG_PRECISION_RECALL_DESIGN.md §4.3
+    multi_seed_data = None
+    from stg_engine.recall import _split_tokens
+    split_tokens = _split_tokens(text)
+
+    # ─── Phase 6: A — exact anchor match (whole-token node names) ────
+    # Whitespace-split chunks that exactly match a node name are pulled
+    # out before sub-token splitting. They become "exact anchors" — forced
+    # into the activated set, and (if ≥2) trigger a direct edge-pair view.
+    # See STG_R6_EDGE_FALLBACK_SEED_DESIGN.md §A
+    from stg_engine.recall import match_exact_anchors, find_edges_between
+    exact_anchors, remaining_chunks = match_exact_anchors(engine, text)
+    # Tokenize only what wasn't already an exact anchor
+    if exact_anchors and not remaining_chunks:
+        # All input chunks are exact anchors — no further tokenization
+        split_tokens = []
+    elif exact_anchors:
+        split_tokens = _split_tokens(" ".join(remaining_chunks))
+
+    # ─── Phase 5: R6 token routing — node-first, edge always-scanned ─
+    # `classify_tokens` decides which tokens drive multi-seed propagate
+    # (the ones that match a node name). But edge content scan now runs
+    # over ALL tokens — a token matching a node does NOT exclude it from
+    # edge scan. Rationale: "volunteered" might match concept node
+    # [Volunteering_Best_Practices] (irrelevant) AND appear in the
+    # description of [User] -[role=volunteer]-> [Charity_Gala] (the
+    # actual fact). Both are real signals, both should surface. IDF
+    # ranks rare tokens (high signal) above common ones (e.g. "user").
+    # See STG_R6_EDGE_FALLBACK_SEED_DESIGN.md
+    edge_hits_data = []
+    node_tokens: list = []
+    edge_tokens: list = []
+    if not no_edge_fallback and split_tokens:
+        from stg_engine.recall import classify_tokens, scan_edges_by_content
+        node_tokens, edge_tokens = classify_tokens(engine, split_tokens)
+        # Scan ALL tokens against edge meta fields — not only the
+        # node-unmatched ones. IDF naturally suppresses common-token noise.
+        edge_hits_data = scan_edges_by_content(engine, split_tokens)
+        # node-only tokens drive multi-seed dispatch
+        propagate_tokens = node_tokens if node_tokens else split_tokens
+    else:
+        propagate_tokens = split_tokens
+
+    use_multi_seed = (not no_multi_seed) and len(propagate_tokens) >= 2
+
     t0 = time.perf_counter()
     gravity = None
-    if use_gravity:
-        from stg_engine.gravity import gravitational_propagate
-        gravity = engine.get_gravity_map()
-        activated = gravitational_propagate(engine, text, gravity, resolution=resolution)
-    else:
-        activated = engine.propagate(text)
+    with anchor_ctx:
+        if use_multi_seed:
+            from stg_engine.recall import multi_seed_propagate
+            activated, multi_seed_data = multi_seed_propagate(
+                engine, " ".join(propagate_tokens), propagate_tokens,
+                use_gravity=use_gravity, resolution=resolution,
+            )
+        elif use_gravity:
+            from stg_engine.gravity import gravitational_propagate
+            gravity = engine.get_gravity_map()
+            propagate_query = " ".join(propagate_tokens) if propagate_tokens else text
+            activated = gravitational_propagate(engine, propagate_query, gravity, resolution=resolution)
+        else:
+            propagate_query = " ".join(propagate_tokens) if propagate_tokens else text
+            activated = engine.propagate(propagate_query)
     elapsed = time.perf_counter() - t0
-    if not activated:
+    # Ensure gravity is loaded for community aggregation regardless of which
+    # propagate branch was taken (multi-seed wrapper does not return gravity).
+    if use_gravity and gravity is None:
+        gravity = engine.get_gravity_map()
+    # ─── Phase 6 cont. — force-include exact anchors ──────────────────
+    # Anchor nodes may not have been picked up by propagate (e.g. if all
+    # query chunks were anchors and no propagate ran, or if multi-seed
+    # chain intersection over-collapsed and dropped them). Ensure every
+    # exact anchor is in the activated list with non-zero activation so
+    # downstream community aggregate / rendering can surface its edges.
+    if exact_anchors:
+        activated_lower_set = {n.lower() for n in (activated or [])}
+        prepend: list = []
+        for anchor in exact_anchors:
+            key = anchor.lower()
+            if key not in activated_lower_set:
+                node = engine._nodes.get(key)
+                if node is not None:
+                    if node.activation <= 0.0:
+                        node.activation = 1.0
+                    prepend.append(anchor)
+                    activated_lower_set.add(key)
+        if prepend:
+            activated = prepend + (activated or [])
+        if activated and exact_anchors:
+            print(f"  📍 exact anchors: [{', '.join(exact_anchors)}] (forced into result)")
+
+    # Compute anchor-pair edges once; rendered later in Phase 6 view (C / R8)
+    anchor_pair_edges = find_edges_between(engine, exact_anchors) if exact_anchors else []
+
+    if not activated and not edge_hits_data and not anchor_pair_edges:
         print(f"No nodes activated for '{text}'")
         return
+    if not activated:
+        activated = []
+
+    if use_multi_seed and multi_seed_data:
+        token_preview = ', '.join(t for t, _, _ in multi_seed_data)
+        print(f"  🔗 multi-seed chain intersection: [{token_preview}] → {len(activated)} nodes")
+
+    if edge_hits_data:
+        # R6: surface routing — node_tokens drive multi-seed propagate,
+        # but edge scan runs over ALL tokens (IDF re-ranks).
+        node_preview = ', '.join(node_tokens) if node_tokens else '(none)'
+        unmatched = [t for t in split_tokens if t not in node_tokens]
+        unmatched_preview = ', '.join(unmatched) if unmatched else '(none)'
+        print(f"  🪢 token routing: node=[{node_preview}] node_unmatched=[{unmatched_preview}]"
+              f"  edge scan over all {len(split_tokens)} tokens → {len(edge_hits_data)} edge hits")
+
+    if anchor_names:
+        # Surface anchor info to user (debugging + transparency)
+        anchor_preview = ', '.join(anchor_names[:3])
+        more = '' if len(anchor_names) <= 3 else f' +{len(anchor_names) - 3} more'
+        print(f"  ⚓ active_context anchored: [{anchor_preview}{more}]")
+
+    # ─── Phase 1 postprocess: R1 recency soft weight ─────────────────
+    # Pure postprocessing — does not touch propagate / Rust core / gravity.
+    # superseded edges are softly down-weighted, NOT filtered.
+    # See development/design/STG_PRECISION_RECALL_DESIGN.md §4.4
+    if not no_recency_weight:
+        from stg_engine.recall import apply_recency_weight
+        activated = apply_recency_weight(engine, activated)
     res_suffix = f":{resolution}" if use_gravity and resolution != "medium" else ""
     gravity_label = f" [gravity{res_suffix}]" if use_gravity else ""
 
@@ -757,8 +953,103 @@ def cmd_propagate(engine, text, use_gravity=False, resolution="medium", all_chai
             engine, activated, gravity, resolution=resolution,
             k=3, query=text, top_m=top_m,
         )
+        # ─── Phase 1 postprocess: R7 community dominance filter ───────
+        # Fold weak communities below dominance/ratio threshold.
+        # See STG_PRECISION_RECALL_DESIGN.md §4.6
+        if not no_community_filter:
+            from stg_engine.recall import community_dominance_filter
+            communities = community_dominance_filter(communities)
+
+        # ─── A/C anchor-aware community filter ────────────────────────
+        # When exact anchors are present, only keep communities that
+        # actually contain an anchor (or already have a precise hit via
+        # query_seeds / name match). Pure propagate-spread topic noise
+        # without query intent is suppressed entirely.
+        # See STG_R6_EDGE_FALLBACK_SEED_DESIGN.md §C (community filter)
+        if exact_anchors and gravity is not None:
+            anchor_community_ids = set()
+            for anchor in exact_anchors:
+                comms_map = gravity.node_community.get(anchor.lower(), {})
+                cid = comms_map.get(resolution)
+                if cid is not None:
+                    anchor_community_ids.add(cid)
+
+            def _community_id(c):
+                try:
+                    return int(c.community_key.split("_")[-1])
+                except (ValueError, IndexError, AttributeError):
+                    return None
+
+            kept = []
+            for c in communities:
+                cid = _community_id(c)
+                if cid in anchor_community_ids or c.query_seeds or c.name_matched:
+                    kept.append(c)
+            communities = kept
+
+            # Reorder representatives in anchor-bearing communities so the
+            # anchor node sits at the top instead of (potentially unrelated)
+            # high-elevation reps. The original aggregate didn't know about
+            # the user's explicit anchor intent.
+            anchor_lower = {a.lower(): a for a in exact_anchors}
+            for c in communities:
+                cid = _community_id(c)
+                if cid not in anchor_community_ids:
+                    continue
+                # Build anchor RepresentativeEntry list (use existing if any)
+                from stg_engine.types import RepresentativeEntry
+                existing_by_key = {r.node_name.lower(): r for r in c.representatives}
+                elevations = gravity.elevation_by_resolution.get(
+                    resolution, gravity.node_elevation
+                )
+                anchor_entries: list = []
+                for anchor in exact_anchors:
+                    key = anchor.lower()
+                    if key not in anchor_community_ids and key not in existing_by_key:
+                        # Verify this anchor belongs to THIS community
+                        anchor_cid = gravity.node_community.get(key, {}).get(resolution)
+                        if anchor_cid != cid:
+                            continue
+                    if gravity.node_community.get(key, {}).get(resolution) != cid:
+                        continue
+                    if key in existing_by_key:
+                        anchor_entries.append(existing_by_key[key])
+                        continue
+                    node = engine._nodes.get(key)
+                    act = node.activation if node else 0.0
+                    elev = elevations.get(key, 0.0)
+                    anchor_entries.append(
+                        RepresentativeEntry(node_name=anchor, activation=act, elevation=elev)
+                    )
+                # Replace representatives with anchor entries only.
+                # When the user pointed at specific nodes, the other top-by-
+                # elevation reps in the same community are topic context, not
+                # the answer — surfacing their incoming/outgoing edges adds
+                # noise. The 🎯 Anchor-pair view already shows the precise
+                # connection; the community block here just confirms the
+                # anchor's location.
+                if anchor_entries:
+                    c.representatives = anchor_entries
+
         print(f"propagate('{text}') → {len(communities)} community(s) "
               f"from {len(activated)} activated nodes ({elapsed*1000:.1f}ms){gravity_label}:")
+
+        # ─── C / R8: Anchor-pair edge view (TOP PRIORITY) ────────────
+        # Render BEFORE community list so the user's most explicit intent
+        # ("how do these specific nodes connect?") is the first thing
+        # they see, not buried under propagate's topic-level community
+        # output. See STG_R6_EDGE_FALLBACK_SEED_DESIGN.md §C.
+        if anchor_pair_edges:
+            print(f"\n🎯 Anchor-pair edges ({len(anchor_pair_edges)}) — primary answer:")
+            for edge in anchor_pair_edges:
+                label = _format_edge_label(edge)
+                print(f"  [{edge.source}] -[{label}]-> [{edge.target}]")
+                desc = edge.modifiers.get("description")
+                if desc:
+                    desc_short = desc if len(desc) <= 200 else desc[:197] + "..."
+                    print(f"     {desc_short}")
+            print()  # blank line before community list
+
         for c_idx, comm in enumerate(communities, 1):
             tags = []
             if comm.name_matched:
@@ -805,6 +1096,37 @@ def cmd_propagate(engine, text, use_gravity=False, resolution="medium", all_chai
         for name in activated[:expand_top]:
             print(f"\n  --- {name} ---")
             cmd_node(engine, name)
+
+    # Anchor-pair view rendered above (top of community block) when
+    # community_mode is on. For node-mode (no gravity), render here as a
+    # fallback so it still surfaces.
+    if anchor_pair_edges and not community_mode:
+        print(f"\n🎯 Anchor-pair edges ({len(anchor_pair_edges)}) — primary answer:")
+        for edge in anchor_pair_edges:
+            label = _format_edge_label(edge)
+            print(f"  [{edge.source}] -[{label}]-> [{edge.target}]")
+            desc = edge.modifiers.get("description")
+            if desc:
+                desc_short = desc if len(desc) <= 200 else desc[:197] + "..."
+                print(f"     {desc_short}")
+
+    # ─── R6: Event-Edge view ──────────────────────────────────────────
+    # Render edges whose meta semantic fields matched edge-fallback tokens.
+    # Mark "double hit" when an edge endpoint also appears in the propagate
+    # node result (= both topic-matched and fact-matched, highest priority).
+    if edge_hits_data:
+        activated_lower = {n.lower() for n in activated} if activated else set()
+        print(f"\n🪢 Event-edge matches ({len(edge_hits_data)}):")
+        for edge, matched, score in edge_hits_data:
+            label = _format_edge_label(edge)
+            double_hit = (edge.source.lower() in activated_lower) or (edge.target.lower() in activated_lower)
+            mark = "  🔗 双重命中" if double_hit else ""
+            print(f"  [{edge.source}] -[{label}]-> [{edge.target}]  score={score:.2f}{mark}")
+            desc = edge.modifiers.get("description")
+            if desc:
+                desc_short = desc if len(desc) <= 120 else desc[:117] + "..."
+                print(f"     {desc_short}")
+            print(f"     matched: {', '.join(matched)}")
 
     # Show learning summary
     log = engine.learning_log
@@ -898,17 +1220,104 @@ def cmd_select(engine, args):
     print(f"Active context set ({len(result.selected_nodes)} nodes)")
 
 
+def _config_get_path(config: dict, dotted_key: str):
+    """Look up a dotted key in a nested config dict. Returns (value, found)."""
+    parts = dotted_key.split(".")
+    cur = config
+    for p in parts:
+        if not isinstance(cur, dict) or p not in cur:
+            return None, False
+        cur = cur[p]
+    return cur, True
+
+
+def _config_set_path(config: dict, dotted_key: str, value) -> None:
+    """Set a dotted key in a nested config dict, creating parents as needed."""
+    parts = dotted_key.split(".")
+    cur = config
+    for p in parts[:-1]:
+        nxt = cur.get(p)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[p] = nxt
+        cur = nxt
+    cur[parts[-1]] = value
+
+
+def _config_unset_path(config: dict, dotted_key: str) -> bool:
+    """Remove a dotted key. Returns True if deletion happened."""
+    parts = dotted_key.split(".")
+    cur = config
+    for p in parts[:-1]:
+        if not isinstance(cur, dict) or p not in cur:
+            return False
+        cur = cur[p]
+    if isinstance(cur, dict) and parts[-1] in cur:
+        del cur[parts[-1]]
+        return True
+    return False
+
+
+def _config_coerce_value(raw: str, hint: str = None):
+    """Coerce a raw CLI arg into a typed value based on the key hint.
+
+    - keys ending in '.roots' / 'roots'   → split on comma
+    - raw 'true' / 'false'                → bool
+    - raw that's all-digits (signed OK)   → int
+    - else                                → str
+    """
+    if hint and hint.endswith(".roots") or hint == "roots":
+        return [p.strip() for p in raw.split(",") if p.strip()]
+    s = raw.strip()
+    if s.lower() == "true":
+        return True
+    if s.lower() == "false":
+        return False
+    if s.lstrip("-").isdigit():
+        try:
+            return int(s)
+        except ValueError:
+            pass
+    return raw
+
+
+def _format_config_value(v) -> str:
+    if isinstance(v, list):
+        return ",".join(str(x) for x in v)
+    return str(v)
+
+
 def cmd_config(args):
     """User-level config (~/.stg/config.json) manipulation.
 
     Usage:
       stg config list                           — show all config keys
-      stg config get <key>                      — read one key
-      stg config set <key> <value>              — set one key
-      stg config unset <key>                    — remove one key
+      stg config get <key>                      — read one key (supports dotted paths)
+      stg config set <key> <value>              — set one key (supports dotted paths)
+      stg config unset <key>                    — remove one key (supports dotted paths)
+
+    Dotted keys nest into sub-objects. Examples:
+      stg config set skill.enabled true
+      stg config set skill.roots "/abs/path1,/abs/path2"
+      stg config set skill.interpreters.myvenv "/abs/path/to/python3"
+      stg config get skill.roots
+
+    Value coercion:
+      - "true" / "false" → boolean
+      - all-digits       → integer
+      - for keys ending in ".roots" or "roots" → comma-separated list
+      - else             → string
 
     Known keys:
-      default_agent    — agent name used when no --agent/STG_AGENT given
+      default_agent                     — agent name used when no --agent/STG_AGENT given
+      skill.enabled                     — bool, master switch for `stg use` (default: false)
+      skill.roots                       — list[str], whitelisted script path roots (default: [])
+      skill.interpreters.<name>         — str, absolute path to a named interpreter binary
+      skill.default_timeout_s           — int, fallback timeout when Skill edge doesn't specify (default: 60)
+      skill.max_timeout_s               — int, hard cap applied to any resolved timeout (default: 600)
+      skill.output_cap_bytes            — int, max captured stdout (default: 10485760)
+      feedback.session_end_hook         — str, shell-quoted command run after `feedback session-end` succeeds (default: unset). No shell invoked. Use to plug in backups, sync, etc.
+      feedback.session_end_hook_timeout_s — int, max seconds the post-hook may run (default: 300)
     """
     if not args:
         print(cmd_config.__doc__.strip())
@@ -922,14 +1331,22 @@ def cmd_config(args):
             print(f"(empty — {_USER_CONFIG_PATH} does not exist or has no keys)")
             return
         print(f"# {_USER_CONFIG_PATH}")
-        for k, v in config.items():
-            print(f"  {k} = {v!r}")
+        # Render flat: walk nested dicts into dotted keys
+        def _walk(prefix, node):
+            if isinstance(node, dict):
+                for k in sorted(node.keys()):
+                    _walk(prefix + [k], node[k])
+            else:
+                key = ".".join(prefix)
+                print(f"  {key} = {_format_config_value(node)!r}")
+        _walk([], config)
         return
 
     if sub == "get" and len(args) >= 2:
         key = args[1]
-        if key in config:
-            print(config[key])
+        value, found = _config_get_path(config, key)
+        if found:
+            print(_format_config_value(value))
         else:
             print(f"(unset) — would fall back to built-in default", file=sys.stderr)
             sys.exit(1)
@@ -937,16 +1354,16 @@ def cmd_config(args):
 
     if sub == "set" and len(args) >= 3:
         key = args[1]
-        value = args[2]
-        config[key] = value
+        raw = args[2]
+        value = _config_coerce_value(raw, hint=key)
+        _config_set_path(config, key, value)
         _write_user_config(config)
-        print(f"{key} = {value!r}  (saved to {_USER_CONFIG_PATH})")
+        print(f"{key} = {_format_config_value(value)!r}  (saved to {_USER_CONFIG_PATH})")
         return
 
     if sub == "unset" and len(args) >= 2:
         key = args[1]
-        if key in config:
-            del config[key]
+        if _config_unset_path(config, key):
             _write_user_config(config)
             print(f"unset {key}  (saved to {_USER_CONFIG_PATH})")
         else:
@@ -1137,7 +1554,7 @@ def _is_virtual_edge(e):
     return "virtual_reason" in mods
 
 
-def _render_node_detail(engine, name, indent="", show_virtual=False):
+def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None):
     """Print full node detail with configurable indent.
 
     Extracted from cmd_node so community-mode propagate can inline
@@ -1146,6 +1563,9 @@ def _render_node_detail(engine, name, indent="", show_virtual=False):
     Virtual edges are filtered by default (show_virtual=False) — they are
     auto-generated structural bridges with no real description, and clutter
     the output. Count of hidden virtual edges is still reported.
+
+    If `limit` is set, only the first N edges in each direction are rendered
+    (useful for high-degree nodes like `Jesus` with 470+ real edges).
     """
     name, node = _resolve_node_name(engine, name)
     if not node:
@@ -1173,30 +1593,44 @@ def _render_node_detail(engine, name, indent="", show_virtual=False):
         out_virtual = len(out_edges_all) - len(out_edges)
         in_virtual = len(in_edges_all) - len(in_edges)
     mod_indent = pfx + "      "
+    out_shown = out_edges if limit is None else out_edges[:limit]
+    in_shown = in_edges if limit is None else in_edges[:limit]
+    out_truncated = len(out_edges) - len(out_shown)
+    in_truncated = len(in_edges) - len(in_shown)
     if out_edges:
-        print(f"\n{pfx}  Outgoing ({len(out_edges)}):")
-        for e in out_edges:
+        header = f"\n{pfx}  Outgoing ({len(out_edges)})"
+        if limit is not None and len(out_edges) > limit:
+            header += f" [showing {limit}]"
+        print(f"{header}:")
+        for e in out_shown:
             rule_str = f', rule="{e.rule}"' if e.rule else ""
             sal_str = f", sal={e.salience:.2f}" if abs(e.salience - e.confidence) > 0.01 else ""
             print(f"{pfx}    → [{e.target}] (c={e.confidence}, s={e.strength}{sal_str}{rule_str})")
             for line in _format_edge_modifiers(e, indent=mod_indent):
                 print(line)
+        if out_truncated:
+            print(f"{pfx}    (+ {out_truncated} more outgoing edge(s) truncated, raise --limit to show)")
     if out_virtual:
         print(f"{pfx}    (+ {out_virtual} virtual edge(s) hidden, use --virtual to show)")
     if in_edges:
-        print(f"\n{pfx}  Incoming ({len(in_edges)}):")
-        for e in in_edges:
+        header = f"\n{pfx}  Incoming ({len(in_edges)})"
+        if limit is not None and len(in_edges) > limit:
+            header += f" [showing {limit}]"
+        print(f"{header}:")
+        for e in in_shown:
             rule_str = f', rule="{e.rule}"' if e.rule else ""
             sal_str = f", sal={e.salience:.2f}" if abs(e.salience - e.confidence) > 0.01 else ""
             print(f"{pfx}    ← [{e.source}] (c={e.confidence}, s={e.strength}{sal_str}{rule_str})")
             for line in _format_edge_modifiers(e, indent=mod_indent):
                 print(line)
+        if in_truncated:
+            print(f"{pfx}    (+ {in_truncated} more incoming edge(s) truncated, raise --limit to show)")
     if in_virtual:
         print(f"{pfx}    (+ {in_virtual} virtual edge(s) hidden, use --virtual to show)")
 
 
-def cmd_node(engine, name, show_virtual=False):
-    _render_node_detail(engine, name, indent="", show_virtual=show_virtual)
+def cmd_node(engine, name, show_virtual=False, limit=None):
+    _render_node_detail(engine, name, indent="", show_virtual=show_virtual, limit=limit)
 
 
 def _save_last_ingest(new_nodes, candidates):
@@ -2658,6 +3092,41 @@ def cmd_feedback(engine, subcmd, args):
         print(f"  Total turns: {fs.get('total_turns', 0)}")
         print(f"  Hebbian events: {fs.get('total_hebbian_events', 0)}")
 
+        # Post-hook (opt-in, multi-user safe — defaults empty, configured per-box).
+        # Set via: stg config set feedback.session_end_hook '<command line>'
+        # Shell-style quoting honored via shlex; no shell is invoked. Hook failure
+        # is logged but does NOT fail session-end (cleanup already succeeded).
+        user_cfg = _read_user_config()
+        feedback_cfg = user_cfg.get("feedback") or {}
+        hook_cmd = feedback_cfg.get("session_end_hook")
+        if hook_cmd:
+            import shlex
+            import subprocess
+            try:
+                timeout_s = int(feedback_cfg.get("session_end_hook_timeout_s") or 300)
+            except (TypeError, ValueError):
+                timeout_s = 300
+            argv = shlex.split(hook_cmd) if isinstance(hook_cmd, str) else list(hook_cmd)
+            try:
+                r = subprocess.run(
+                    argv, timeout=timeout_s, capture_output=True, text=True
+                )
+                if r.returncode == 0:
+                    last_line = (r.stdout.strip().splitlines() or [""])[-1]
+                    print(f"  Post-hook ok: {argv[0]}{(' — ' + last_line) if last_line else ''}")
+                else:
+                    err_snip = (r.stderr or r.stdout or "").strip()[:200]
+                    print(
+                        f"  Post-hook FAILED (exit {r.returncode}): {err_snip}",
+                        file=sys.stderr,
+                    )
+            except subprocess.TimeoutExpired:
+                print(f"  Post-hook TIMEOUT after {timeout_s}s", file=sys.stderr)
+            except FileNotFoundError as e:
+                print(f"  Post-hook ERROR: command not found ({e})", file=sys.stderr)
+            except Exception as e:
+                print(f"  Post-hook ERROR: {type(e).__name__}: {e}", file=sys.stderr)
+
     else:
         print("Usage: feedback [status|simulate|periodic|session-end]")
         print("  status                     Show feedback loop statistics")
@@ -3276,6 +3745,345 @@ def cmd_perception(engine, args):
         print("  reset-filters      Re-initialize learnable filters")
 
 
+# ===========================================================================
+# Skill executor commands (v0.3.1+)
+# See development/design/STG_SKILL_EXECUTOR_DESIGN.md
+# ===========================================================================
+
+def cmd_use(engine, args):
+    """stg use <skill_name> [script_args...]
+
+    Execute a Skill node via its registered script. Requires:
+      - skill.enabled=true in user config (`stg config set skill.enabled true`)
+      - skill.roots whitelisting the script's directory
+      - executable=true modifier on the Skill edge
+
+    Flags (consumed by this command, not passed to the script):
+      --timeout N        override timeout seconds
+      --args-stl STL     pass an STL block via the script's stdin
+      --stdin STL        alias for --args-stl
+      --json             emit {stdout, stderr, exit_code, elapsed_s} as JSON
+      --dry-run          resolve + validate but don't execute
+    """
+    from stg_engine import skill_runner
+
+    if not args:
+        print(cmd_use.__doc__.strip())
+        sys.exit(skill_runner.EXIT_ENGINE_ERROR)
+
+    skill_name = args[0]
+    rest = list(args[1:])
+
+    timeout_override: Optional[int] = None
+    stdin_stl: Optional[str] = None
+    emit_json = False
+    dry_run = False
+
+    filtered: list = []
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok == "--timeout" and i + 1 < len(rest):
+            try:
+                timeout_override = int(rest[i + 1])
+            except ValueError:
+                print(f"invalid --timeout value: {rest[i+1]!r}", file=sys.stderr)
+                sys.exit(skill_runner.EXIT_ENGINE_ERROR)
+            i += 2
+            continue
+        if tok in ("--args-stl", "--stdin") and i + 1 < len(rest):
+            stdin_stl = rest[i + 1]
+            i += 2
+            continue
+        if tok == "--args-stl-file" and i + 1 < len(rest):
+            try:
+                stdin_stl = Path(rest[i + 1]).read_text()
+            except OSError as e:
+                print(f"cannot read --args-stl-file: {e}", file=sys.stderr)
+                sys.exit(skill_runner.EXIT_ENGINE_ERROR)
+            i += 2
+            continue
+        if tok == "--json":
+            emit_json = True
+            i += 1
+            continue
+        if tok == "--dry-run":
+            dry_run = True
+            i += 1
+            continue
+        filtered.append(tok)
+        i += 1
+
+    user_cfg = _read_user_config()
+
+    result = skill_runner.run_skill(
+        engine=engine,
+        skill_name=skill_name,
+        args=filtered,
+        user_config=user_cfg,
+        stdin_stl=stdin_stl,
+        timeout_override=timeout_override,
+        dry_run=dry_run,
+    )
+
+    # Write audit row (only for real attempts, not config-disabled)
+    if result.exit_code != skill_runner.EXIT_NOT_EXECUTABLE or result.path:
+        skill_runner.write_audit_row(STG_PATH, result)
+
+    if emit_json:
+        import json as _json
+        payload = {
+            "skill_name": result.skill_name,
+            "target": result.target,
+            "path": result.path,
+            "interpreter": result.interpreter,
+            "args": result.args,
+            "exit_code": result.exit_code,
+            "elapsed_s": result.elapsed_s,
+            "bytes_out": result.bytes_out,
+            "bytes_err": result.bytes_err,
+            "truncated": result.truncated_stdout,
+            "timed_out": result.timed_out,
+            "invocation_id": result.invocation_id,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "error": result.error,
+        }
+        print(_json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        if result.stdout:
+            sys.stdout.write(result.stdout)
+            if not result.stdout.endswith("\n"):
+                sys.stdout.write("\n")
+        if result.stderr:
+            sys.stderr.write(result.stderr)
+            if not result.stderr.endswith("\n"):
+                sys.stderr.write("\n")
+        if result.error:
+            print(f"error: {result.error}", file=sys.stderr)
+        if result.exit_code != 0:
+            tag = (
+                "[timeout]" if result.timed_out
+                else "[child-exit]" if result.exit_code == skill_runner.EXIT_CHILD_NONZERO
+                else "[error]"
+            )
+            print(f"\n{tag} skill={result.skill_name} "
+                  f"exit={result.exit_code} elapsed={result.elapsed_s:.2f}s",
+                  file=sys.stderr)
+
+    sys.exit(result.exit_code)
+
+
+def cmd_skill(engine, args):
+    """stg skill <subcommand> [...]
+
+    Subcommands:
+      list [--filter KEYWORD] [--all]   Catalog of skills
+      show <name>                       Full detail on one skill
+      use <name> [args...]              Alias for `stg use <name> [args...]`
+      configure <name> [--executable] [--interpreter NAME] [--args-template T] [--stl-io] [--timeout N]
+                                         Backfill invocation fields on an existing Skill edge
+      history [--skill N] [--limit N]   Recent invocations
+    """
+    from stg_engine import skill_runner
+
+    if not args:
+        print(cmd_skill.__doc__.strip())
+        return
+
+    sub = args[0]
+    rest = list(args[1:])
+
+    if sub == "list":
+        filter_kw: Optional[str] = None
+        show_all = False
+        i = 0
+        while i < len(rest):
+            tok = rest[i]
+            if tok == "--filter" and i + 1 < len(rest):
+                filter_kw = rest[i + 1]
+                i += 2
+                continue
+            if tok == "--all":
+                show_all = True
+                i += 1
+                continue
+            i += 1
+        skills = skill_runner.list_skills(
+            engine,
+            filter_keyword=filter_kw,
+            executable_only=not show_all,
+        )
+        print(skill_runner.render_catalog(skills))
+        return
+
+    if sub == "show" and rest:
+        name = rest[0]
+        edges = skill_runner.find_skill_edges_by_name(engine, name)
+        if not edges:
+            print(f"no Skill node named '{name}' found.")
+            sys.exit(skill_runner.EXIT_NOT_FOUND)
+        for u, v, data in edges:
+            from stg_engine.engine import _get_skill_invocation as _inv
+            inv = _inv(data)
+            print(f"Skill: {u}  →  {v}")
+            print(f"  confidence: {data.get('confidence', '?')}")
+            if data.get("rule"):
+                print(f"  rule:       {data.get('rule')}")
+            if data.get("description"):
+                print(f"  description: {data.get('description')}")
+            if data.get("path"):
+                print(f"  path:       {data.get('path')}")
+            for k in ("executable", "interpreter", "args_template",
+                      "stl_io", "timeout_s"):
+                if k in inv:
+                    print(f"  {k}: {inv[k]}")
+            print()
+        # Also show recent invocations
+        history = skill_runner.read_audit_history(STG_PATH, skill_name=name, limit=5)
+        if history:
+            print(f"Recent invocations (last {len(history)}):")
+            for row in history:
+                status = "ok" if row["exit_code"] == 0 else f"exit {row['exit_code']}"
+                import datetime as _dt
+                ts = _dt.datetime.fromtimestamp(row["timestamp"]).strftime("%Y-%m-%d %H:%M:%S")
+                print(f"  {ts}  [{status}]  {row['elapsed_s']:.2f}s  "
+                      f"args: {row['args_preview']}")
+        return
+
+    if sub == "use" and rest:
+        cmd_use(engine, rest)
+        return  # cmd_use calls sys.exit()
+
+    if sub == "configure" and rest:
+        _skill_configure(engine, rest)
+        return
+
+    if sub == "history":
+        filter_name: Optional[str] = None
+        limit = 20
+        i = 0
+        while i < len(rest):
+            tok = rest[i]
+            if tok == "--skill" and i + 1 < len(rest):
+                filter_name = rest[i + 1]
+                i += 2
+                continue
+            if tok == "--limit" and i + 1 < len(rest):
+                try:
+                    limit = int(rest[i + 1])
+                except ValueError:
+                    pass
+                i += 2
+                continue
+            i += 1
+        history = skill_runner.read_audit_history(
+            STG_PATH, skill_name=filter_name, limit=limit
+        )
+        if not history:
+            print("(no invocations recorded)")
+            return
+        import datetime as _dt
+        for row in history:
+            status = "ok" if row["exit_code"] == 0 else f"exit {row['exit_code']}"
+            ts = _dt.datetime.fromtimestamp(row["timestamp"]).strftime("%Y-%m-%d %H:%M:%S")
+            flags = []
+            if row["truncated"]: flags.append("truncated")
+            if row["timed_out"]: flags.append("timeout")
+            flag_s = f" [{','.join(flags)}]" if flags else ""
+            print(f"{ts}  {row['skill_name']:<35}  [{status}]  "
+                  f"{row['elapsed_s']:.2f}s{flag_s}  {row['args_preview']}")
+        return
+
+    print(cmd_skill.__doc__.strip())
+
+
+def _skill_configure(engine, args):
+    """Backfill invocation fields on an existing Skill edge via stg merge.
+
+    Usage:
+      stg skill configure <name> [--executable] [--no-executable]
+                                 [--interpreter NAME]
+                                 [--args-template STRING]
+                                 [--stl-io] [--no-stl-io]
+                                 [--timeout N]
+    """
+    from stg_engine import skill_runner
+
+    if not args:
+        print(_skill_configure.__doc__.strip())
+        return
+    name = args[0]
+    rest = args[1:]
+
+    fields: dict = {}
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok == "--executable":
+            fields["executable"] = "true"; i += 1
+        elif tok == "--no-executable":
+            fields["executable"] = "false"; i += 1
+        elif tok == "--interpreter" and i + 1 < len(rest):
+            fields["interpreter"] = rest[i + 1]; i += 2
+        elif tok == "--args-template" and i + 1 < len(rest):
+            fields["args_template"] = rest[i + 1]; i += 2
+        elif tok == "--stl-io":
+            fields["stl_io"] = "true"; i += 1
+        elif tok == "--no-stl-io":
+            fields["stl_io"] = "false"; i += 1
+        elif tok == "--timeout" and i + 1 < len(rest):
+            fields["timeout_s"] = rest[i + 1]; i += 2
+        else:
+            print(f"unknown flag: {tok}", file=sys.stderr)
+            sys.exit(skill_runner.EXIT_ENGINE_ERROR)
+
+    if not fields:
+        print("no fields given — see `stg skill configure --help`")
+        sys.exit(skill_runner.EXIT_ENGINE_ERROR)
+
+    edges = skill_runner.find_skill_edges_by_name(engine, name)
+    if not edges:
+        print(f"no Skill node named '{name}' found. Run `stg skill list` to see available skills.",
+              file=sys.stderr)
+        sys.exit(skill_runner.EXIT_NOT_FOUND)
+
+    if len(edges) > 1:
+        # Auto-pick the edge that has a `path` modifier — that's the primary
+        # "what this skill does" edge. Other edges (e.g. to a Lesson) are
+        # secondary and don't need invocation fields.
+        with_path = [e for e in edges if e[2].get("path")]
+        if len(with_path) == 1:
+            edges = with_path
+        else:
+            targets = [v for _, v, _ in edges]
+            with_paths = [v for _, v, d in edges if d.get("path")]
+            print(
+                f"'{name}' has {len(edges)} edges and no single one is the "
+                f"obvious primary (by path= modifier).\n"
+                f"  all targets:       {targets}\n"
+                f"  targets with path: {with_paths}\n"
+                f"Disambiguate with the full `stg merge` form specifying the target:\n"
+                f"  stg merge '[{name}] -> [TARGET] ::mod(executable=\"true\", ...)'",
+                file=sys.stderr,
+            )
+            sys.exit(skill_runner.EXIT_AMBIGUOUS)
+
+    # Build STL for merge
+    source, target, _ = edges[0]
+    mod_kv = ", ".join(f'{k}="{v}"' for k, v in fields.items())
+    stl_text = f'[{source}] -> [{target}] ::mod({mod_kv})'
+    cmd_merge(engine, stl_text)
+
+
+def cmd_skill_propagate_catalog(engine, query: str):
+    """When propagate query matches /^skills?$/i, render a catalog instead of
+    the usual community-grouped output."""
+    from stg_engine import skill_runner
+    skills = skill_runner.list_skills(engine, executable_only=False)
+    print(skill_runner.render_catalog(skills))
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -3322,6 +4130,10 @@ def main():
     elif cmd == "grep" and len(sys.argv) >= 3:
         args = sys.argv[2:]
         limit = 20
+        full = False
+        if "--full" in args:
+            full = True
+            args = [a for a in args if a != "--full"]
         if "--limit" in args:
             idx = args.index("--limit")
             if idx + 1 < len(args):
@@ -3330,7 +4142,7 @@ def main():
                 except ValueError:
                     pass
                 args = args[:idx] + args[idx + 2:]
-        cmd_grep(engine, " ".join(args), limit=limit)
+        cmd_grep(engine, " ".join(args), limit=limit, full=full)
     elif cmd == "dump":
         args = sys.argv[2:]
         page_size = 100
@@ -3368,6 +4180,16 @@ def main():
         cmd_tensions(engine, status)
     elif cmd == "propagate" and len(sys.argv) >= 3:
         args = sys.argv[2:]
+        # Short-circuit: `propagate skill` (or skills / SKILL / --namespace=Skill)
+        # renders the Skill catalog instead of the usual community-grouped view.
+        _catalog_trigger = False
+        if len(args) == 1 and re.match(r"^skills?$", args[0], re.IGNORECASE):
+            _catalog_trigger = True
+        if "--namespace=Skill" in args or "--namespace=skill" in args:
+            _catalog_trigger = True
+        if _catalog_trigger:
+            cmd_skill_propagate_catalog(engine, args[0] if args else "skill")
+            return
         # Gravity is ON by default (GP Phase 4). Use --no-gravity to disable.
         if "--no-gravity" in args:
             use_gravity = False
@@ -3425,10 +4247,40 @@ def main():
         show_virtual = "--virtual" in args
         if show_virtual:
             args = [a for a in args if a != "--virtual"]
+        # Precision Recall escape hatches (default: postprocess ON):
+        #   --no-recency-weight   disable R1 (recency × supersede soft decay)
+        #   --no-community-filter disable R7 (community dominance ratio)
+        #   --no-context-anchor   disable R5 (active_context elevation boost)
+        #   --no-multi-seed       disable R2 (multi-token chain intersection)
+        #   --no-edge-fallback    disable R6 (edge-content fallback for unmatched tokens)
+        #   --legacy              equivalent to all --no-* flags above
+        legacy_mode = "--legacy" in args
+        if legacy_mode:
+            args = [a for a in args if a != "--legacy"]
+        no_recency_weight = legacy_mode or "--no-recency-weight" in args
+        if "--no-recency-weight" in args:
+            args = [a for a in args if a != "--no-recency-weight"]
+        no_community_filter = legacy_mode or "--no-community-filter" in args
+        if "--no-community-filter" in args:
+            args = [a for a in args if a != "--no-community-filter"]
+        no_context_anchor = legacy_mode or "--no-context-anchor" in args
+        if "--no-context-anchor" in args:
+            args = [a for a in args if a != "--no-context-anchor"]
+        no_multi_seed = legacy_mode or "--no-multi-seed" in args
+        if "--no-multi-seed" in args:
+            args = [a for a in args if a != "--no-multi-seed"]
+        no_edge_fallback = legacy_mode or "--no-edge-fallback" in args
+        if "--no-edge-fallback" in args:
+            args = [a for a in args if a != "--no-edge-fallback"]
         cmd_propagate(engine, " ".join(args), use_gravity=use_gravity, resolution=resolution,
                       all_chains=all_chains, all_modifiers=all_modifiers, expand_top=expand_top,
                       community_mode=community_mode, top_m=top_m, brief=brief,
-                      show_virtual=show_virtual)
+                      show_virtual=show_virtual,
+                      no_recency_weight=no_recency_weight,
+                      no_community_filter=no_community_filter,
+                      no_context_anchor=no_context_anchor,
+                      no_multi_seed=no_multi_seed,
+                      no_edge_fallback=no_edge_fallback)
     elif cmd == "gravity":
         subcmd = sys.argv[2] if len(sys.argv) >= 3 else "info"
         cmd_gravity(engine, subcmd, sys.argv[3:] if len(sys.argv) >= 4 else [])
@@ -3442,8 +4294,17 @@ def main():
         node_args = sys.argv[2:]
         show_virtual = "--virtual" in node_args
         node_args = [a for a in node_args if a != "--virtual"]
+        limit = None
+        if "--limit" in node_args:
+            idx = node_args.index("--limit")
+            if idx + 1 < len(node_args):
+                try:
+                    limit = int(node_args[idx + 1])
+                except ValueError:
+                    pass
+                node_args = node_args[:idx] + node_args[idx + 2:]
         if node_args:
-            cmd_node(engine, node_args[0], show_virtual=show_virtual)
+            cmd_node(engine, node_args[0], show_virtual=show_virtual, limit=limit)
     elif cmd == "ingest" and len(sys.argv) >= 3:
         args = sys.argv[2:]
         cognitive = "--cognitive" in args
@@ -3676,6 +4537,10 @@ def main():
         cmd_perceive(engine, sys.argv[2:])
     elif cmd == "perception":
         cmd_perception(engine, sys.argv[2:])
+    elif cmd == "use" and len(sys.argv) >= 3:
+        cmd_use(engine, sys.argv[2:])
+    elif cmd == "skill":
+        cmd_skill(engine, sys.argv[2:])
     else:
         print(__doc__)
         sys.exit(1)

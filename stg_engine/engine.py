@@ -40,6 +40,58 @@ def _get_semantic_field(modifiers: Optional[dict]) -> Tuple[Optional[str], Optio
             return f, str(v)
     return None, None
 
+
+# Skill invocation modifiers — orthogonal to SEMANTIC_FIELDS. These describe HOW
+# to invoke a Skill node (path, interpreter, timeout) rather than the semantic
+# relation between nodes. Used by the skill_runner module; see
+# development/design/STG_SKILL_EXECUTOR_DESIGN.md.
+SKILL_INVOCATION_FIELDS: Tuple[str, ...] = (
+    "executable",
+    "interpreter",
+    "args_template",
+    "stl_io",
+    "timeout_s",
+    "allow_root_override",
+)
+
+# The Skill namespace is reserved: only nodes in this namespace are considered
+# by `stg use` and the `stg skill` subcommand family.
+SKILL_NAMESPACE: str = "Skill"
+
+
+def _truthy(val) -> bool:
+    """Parse STL modifier strings as booleans. STL stores everything as strings."""
+    if val is None:
+        return False
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in ("true", "1", "yes", "on")
+
+
+def _get_skill_invocation(modifiers: Optional[dict]) -> dict:
+    """Extract the skill invocation subset from an edge's modifiers.
+
+    Returns a dict with only the SKILL_INVOCATION_FIELDS that are present.
+    `executable` and `stl_io` are coerced to bool; `timeout_s` to int.
+    """
+    if not modifiers:
+        return {}
+    out: dict = {}
+    for f in SKILL_INVOCATION_FIELDS:
+        if f not in modifiers:
+            continue
+        v = modifiers[f]
+        if f in ("executable", "stl_io"):
+            out[f] = _truthy(v)
+        elif f == "timeout_s":
+            try:
+                out[f] = int(str(v))
+            except (TypeError, ValueError):
+                continue
+        else:
+            out[f] = str(v)
+    return out
+
 import networkx as nx
 
 from stg_engine.types import (
@@ -60,8 +112,11 @@ from stg_engine.formulas import (
 )
 from stg_engine.persistence import save_engine_state, load_engine_state
 
-# ─── Rust core (required) ──────────────────────────────────────────
-from stg_engine import _rust_core as _rust
+# ─── Hot-path core: optional Rust, pure-Python fallback ──────────
+try:
+    from stg_engine import _rust_core as _rust
+except ImportError:
+    from stg_engine import _core_fallback as _rust
 
 
 class STGEngine:
@@ -461,7 +516,13 @@ class STGEngine:
         # If (source, target) already exists:
         #   - Semantically identical: true duplicate, skip (return existing)
         #   - Different content: allow multi-edge (knowledge evolution)
-        #     Old edge stays in _edges list, lookup points to newest
+        #     Old edge stays in _edges list, lookup points to newest.
+        # Note: supersede flagging is NOT done here — same (src,tgt) edges
+        # often carry complementary semantic facets (e.g. action="took" vs
+        # status="had_amazing_time"), not corrections. Supersede is detected
+        # exclusively by _flag_suspected_supersede() below, which requires
+        # same (semantic_field, value) but DIFFERENT target — the only
+        # configuration that signals an actual correction.
         existing_edge = self._edges_lookup.get((_src, _tgt))
         if existing_edge and existing_edge.modifiers.get("edge_class") != "virtual":
             # Check if new edge is semantically identical to existing
@@ -475,11 +536,9 @@ class STGEngine:
             if is_true_duplicate:
                 # True duplicate — no new information, skip
                 return existing_edge
-            else:
-                # Knowledge evolution — allow multi-edge
-                # Mark old edge as superseded, keep in _edges for history
-                existing_edge.modifiers["superseded_at"] = created_at or _time.time()
-                # Fall through to create new edge; lookup will point to it
+            # Otherwise fall through to create new edge; lookup will point to it.
+            # No supersede flag — let _flag_suspected_supersede decide based on
+            # actual semantic conflict (same field+value, different target).
 
         edge = STGEdge(
             source=_src_dn,  # display name on edge (user-facing)

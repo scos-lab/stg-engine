@@ -96,7 +96,7 @@ def assert_dicts_close(
 def test_import_rust_core():
     """Smoke test: the Rust extension imports cleanly."""
     from stg_engine import _rust_core
-    assert _rust_core.__version__ == "0.2.0-alpha.1"
+    assert _rust_core.__version__ == "0.3.0-alpha.1"
     assert _rust_core.__license__ == "BUSL-1.1"
     assert hasattr(_rust_core, "propagate_inner_loop")
     print(f"  ✓ _rust_core v{_rust_core.__version__} loaded")

@@ -116,8 +116,18 @@ def save_active_context(
         conn.commit()
 
 
-def load_active_context(stg_path: str, session_id: str = "default") -> List[Tuple[str, float]]:
+def load_active_context(
+    stg_path: str,
+    session_id: str = "default",
+    ttl_seconds: Optional[float] = None,
+) -> List[Tuple[str, float]]:
     """Load active context from .stg SQLite.
+
+    Args:
+        stg_path: path to .stg file
+        session_id: session id (default 'default')
+        ttl_seconds: if provided, exclude entries older than this many seconds.
+            None (default) = no TTL filter (backward compatible).
 
     Returns:
         List of (node_name, activation) sorted by activation descending
@@ -137,11 +147,20 @@ def load_active_context(stg_path: str, session_id: str = "default") -> List[Tupl
             if not tables:
                 return []
 
-            rows = conn.execute(
-                "SELECT node_name, activation FROM active_context "
-                "WHERE session_id = ? ORDER BY activation DESC",
-                (session_id,),
-            ).fetchall()
+            if ttl_seconds is not None:
+                cutoff = _time.time() - ttl_seconds
+                rows = conn.execute(
+                    "SELECT node_name, activation FROM active_context "
+                    "WHERE session_id = ? AND updated_at >= ? "
+                    "ORDER BY activation DESC",
+                    (session_id, cutoff),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT node_name, activation FROM active_context "
+                    "WHERE session_id = ? ORDER BY activation DESC",
+                    (session_id,),
+                ).fetchall()
             return [(name, act) for name, act in rows]
     except Exception:
         return []

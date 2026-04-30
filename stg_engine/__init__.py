@@ -19,14 +19,21 @@ Usage:
     engine.save("memory.stg")
 """
 
-__version__ = "0.3.0a1"
+__version__ = "0.5.0a6"
 __author__ = "wuko / scos-lab"
 __license__ = "BUSL-1.1"
 __url__ = "https://github.com/scos-lab/stg-engine"
 
-# Rust core (required for core algorithms)
-from stg_engine import _rust_core
-HAS_RUST_CORE = True
+# Hot-path algorithms: optional Rust extension, pure-Python fallback.
+# The Rust core provides ~30-100x speedup but is optional — if it is
+# unavailable (e.g. installing a pure-Python wheel or an environment
+# without a Rust toolchain for sdist), the fallback module provides
+# semantically-identical Python implementations.
+try:
+    from stg_engine import _rust_core  # noqa: F401
+    HAS_RUST_CORE = True
+except ImportError:
+    HAS_RUST_CORE = False
 
 from stg_engine.engine import STGEngine, SEMANTIC_FIELDS
 from stg_engine.types import (

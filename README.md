@@ -5,8 +5,7 @@
 
 [![License: BUSL-1.1](https://img.shields.io/badge/license-BUSL--1.1-blue.svg)](LICENSE)
 [![Status: Alpha](https://img.shields.io/badge/status-alpha-orange.svg)]()
-[![Tests](https://img.shields.io/badge/tests-1013%20passing-brightgreen.svg)]()
-[![Powered by Rust](https://img.shields.io/badge/powered%20by-Rust-red.svg)]()
+[![Tests](https://img.shields.io/badge/tests-1026%20passing-brightgreen.svg)]()
 
 STG Engine gives AI agents a memory that **learns**, **forgets**, and
 **generalizes** the way cognitive science says memories should — built
@@ -45,8 +44,12 @@ without retraining.
 pip install stg-engine
 ```
 
-(Pre-built wheels available for CPython 3.10–3.12 on Linux, macOS, and Windows.
-The Rust acceleration core is included automatically.)
+Pure-Python distribution — one wheel, all platforms (Linux, macOS, Windows) and all supported Python versions (3.10, 3.11, 3.12). No compilation needed.
+
+An optional Rust acceleration core for hot-path algorithms lives in the
+[source repository](https://github.com/scos-lab/stg-engine) under `rust/` and
+is picked up automatically if compiled locally; the alpha PyPI release
+ships the pure-Python path only.
 
 ### First propagation
 
@@ -97,27 +100,23 @@ See the `examples/` directory for more.
 
 ## Architecture
 
-STG is a **Python package with a Rust acceleration core**:
-
 ```
-stg_engine/                Python — orchestration, persistence, CLI
+stg_engine/                Pure Python — no compilation required
 ├── engine.py              The main STGEngine class
 ├── types.py               Node, Edge, Tension data structures
 ├── formulas.py            Ψ (system stability), tension, activation
 ├── gravity.py             Gravitational propagation + community detection
 ├── learning.py            Hebbian learner + synaptic pruner
 ├── persistence.py         .stg file format (SQLite-backed)
-├── cli.py                 The `stg` command-line tool
-└── _rust_core.so          Compiled Rust algorithms (hot path)
+└── cli.py                 The `stg` command-line tool
 ```
 
-The Rust core implements three hot-path algorithms:
-
-1. **`propagate_inner_loop`** — spreading activation iteration
-2. **`hebbian_update`** — co-activation-driven salience update
-3. **`compute_elevations`** — gravity-based structural importance
-
-All three have a pure-Python fallback if the Rust extension is unavailable.
+The source repository additionally contains an optional Rust acceleration
+core (`rust/`) implementing three hot-path algorithms — `propagate_inner_loop`,
+`hebbian_update`, `compute_elevations`. If the extension is compiled locally
+(`maturin develop`), stg_engine auto-detects it and uses it; otherwise the
+pure-Python path handles everything. PyPI ships the pure-Python path only
+during the alpha phase.
 
 ## Three things STG does that vector DBs cannot
 
@@ -168,6 +167,117 @@ Full CLI reference: `stg --help`
 
 ---
 
+## Precision recall (default in 0.4+)
+
+`stg propagate` does more than spread activation — it now **converges**.
+Four cooperating mechanisms sharpen retrieval without ever filtering an
+edge:
+
+| Mechanism | What it does | When it fires |
+|-----------|--------------|---------------|
+| **R1** Recency × supersede soft weight | Older / superseded edges get softly down-weighted (default 30-day half-life, supersede factor 0.3) | Every propagate |
+| **R2** Multi-seed chain intersection | Each query token runs through propagate separately; output is the node intersection across each token's reconstructed chains | When ≥2 query tokens hit node names |
+| **R5** active_context anchor | Nodes from your last `stg select` get a temporary +5.0 elevation boost, pulling propagate energy toward your current focus | When `active_context` is non-empty (TTL 30 min) |
+| **R6** Edge-as-fallback-seed | Tokens that match no node name fall through to scan edge `description`/`lesson`/`action`/`role`/`status`/`is_a`. Returns event edges as a separate "Event-edge" view | When ≥1 query token misses all node names |
+| **R7** Community dominance ratio | Communities scoring below `dominant/3.0` are folded out — except those containing precise query hits, which are always preserved | Every propagate (community mode) |
+
+The **memory-never-vanishes** principle is hard-coded: superseded edges
+are softly down-weighted, never deleted. Recall completeness is preserved
+across all four mechanisms — they shape ranking, not membership.
+
+Disable any mechanism via flag (rarely needed):
+
+```bash
+stg propagate "your query"                          # default — all five ON
+stg propagate "your query" --no-recency-weight      # disable R1
+stg propagate "your query" --no-multi-seed          # disable R2
+stg propagate "your query" --no-context-anchor      # disable R5
+stg propagate "your query" --no-edge-fallback       # disable R6
+stg propagate "your query" --no-community-filter    # disable R7
+stg propagate "your query" --legacy                 # all five OFF (pre-0.4)
+```
+
+Full design: see `STG_PRECISION_RECALL_DESIGN.md`.
+
+---
+
+## Skills: turning Skill nodes into runnable commands
+
+Skill-namespaced nodes (`Skill:SomeName`) can be registered as **executable**
+and invoked via `stg use`. This makes STG double as a lightweight capability
+registry — ask what you can do, then do it, all inside one tool.
+
+### One-time setup (opt-in)
+
+```bash
+# Master switch — off by default for safety
+stg config set skill.enabled true
+
+# Whitelist the directories where your scripts live
+stg config set skill.roots "/home/you/my-tools,/home/you/workshop"
+
+# (optional) Name interpreters you want to re-use across skills
+stg config set skill.interpreters.myvenv "/home/you/proj/.venv/bin/python3"
+```
+
+### Register a skill
+
+Add a `Skill:`-namespaced node whose outgoing edge carries `path`,
+`executable`, and `interpreter`:
+
+```bash
+stg ingest '[Skill:Greet] -> [Greeting_Target] ::mod(
+  rule="empirical", confidence=0.95,
+  path="/home/you/my-tools/greet.py",
+  description="say hello, optionally to someone",
+  executable="true",
+  interpreter="python3",
+  args_template="[name]",
+  timeout_s="10"
+)'
+```
+
+Or retrofit invocation fields onto an existing Skill edge:
+
+```bash
+stg skill configure Greet --executable --interpreter python3 \
+  --args-template "[name]" --timeout 10
+```
+
+### Browse and run
+
+```bash
+# See every registered skill, executable ones on top
+stg skill list
+
+# Detail on one skill + recent invocations
+stg skill show Greet
+
+# Run it — positional args pass through to the script
+stg use Greet World
+
+# Dry-run to see the resolved command line without executing
+stg use Greet World --dry-run
+
+# Audit log
+stg skill history --limit 10
+```
+
+### Security model
+
+Execution requires **double opt-in**: `skill.enabled=true` in user config AND
+`executable="true"` on the edge. The resolved script path must lie under at
+least one `skill.roots` entry (symlinks resolved). Subprocess invocation uses
+list args (no shell), a hard timeout, and a 10 MB output cap. Every call
+writes one audit row in the `skill_invocations` SQLite table.
+
+Interpreters resolve in this order: absolute path → named entry in
+`skill.interpreters.<name>` → builtin name (`python3`/`python`/`bash`/`sh`/
+`node`) via `shutil.which`. No magic names are hardcoded into the engine;
+portability across machines is the user's responsibility via config.
+
+---
+
 ## License
 
 **STG Engine is dual-licensed:**
@@ -207,11 +317,9 @@ from a single scalar density field ρ(x,t).
 
 ## Status
 
-**0.3.0a1** — Alpha. APIs may change before 1.0.
+**0.3.0a2** — Alpha. APIs may change before 1.0.
 
-- 1013 unit tests passing
-- 22 Rust core unit tests passing
-- 5 Python ↔ Rust parity tests passing
+- 1026 unit tests passing
 - Dogfooded daily as the long-term memory of an AI agent running inside Claude Code
 
 ## Contributing
@@ -236,7 +344,7 @@ If STG helps your research, please cite:
   title = {STG Engine: A Cognitive Memory System for AI Agents},
   year = {2026},
   url = {https://github.com/scos-lab/stg-engine},
-  version = {0.3.0a1}
+  version = {0.3.0a2}
 }
 ```
 
