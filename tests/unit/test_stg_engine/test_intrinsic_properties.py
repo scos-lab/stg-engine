@@ -224,9 +224,12 @@ def test_cli_node_renders_properties_summary(capsys):
     _render_node_detail(e, "Elden_Ring")
     out = capsys.readouterr().out
 
-    # Summary line shows count + redirect to `stg attrs`
+    # Summary line shows count + redirect to `stg attrs`. The hint quotes the
+    # node name for shell-safe copy-paste; the substring check tolerates an
+    # optional `--agent <name>` injected when running against a non-default
+    # agent (test environment may set STG_AGENT).
     assert "Properties: 3 keys" in out
-    assert "stg attrs Elden_Ring" in out
+    assert 'attrs "Elden_Ring"' in out
     # Values are NOT printed in node detail
     assert "appid: 1245620" not in out
     assert "release_year: 2022" not in out

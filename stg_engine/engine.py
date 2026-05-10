@@ -38,6 +38,22 @@ SEMANTIC_FIELDS: Tuple[str, ...] = (
 # different targets is the normal pattern (e.g. one game has many features).
 SUPERSEDE_SINGLE_VALUE_FIELDS: frozenset = frozenset({"status", "phase"})
 
+# Provenance / audit metadata — describes *where this edge came from* rather
+# than what it semantically asserts. Tends to repeat verbatim across batch-
+# ingested edges (e.g. all 36 Elden_Ring edges sharing source="steam_appdetails")
+# and crowds out the semantic core in node views. The cli folds these by
+# default; pass --full to expand. Non-exhaustive — add new audit fields here as
+# they appear. Note: occurred_time and author are intentionally NOT folded —
+# they often carry semantic content (event dates, attribution).
+PROVENANCE_FIELDS: frozenset = frozenset({
+    "source",
+    "created_at",
+    "recorded_at",
+    "superseded_at",
+    "batch_id",
+    "ingested_at",
+})
+
 # Two edges created within this window are treated as a co-declared batch, not
 # a "user updated their mind" pattern. Avoids spam-flagging during bulk ingest.
 SUPERSEDE_MIN_GAP_SECONDS: float = 60.0

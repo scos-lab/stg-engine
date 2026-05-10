@@ -126,7 +126,9 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple
+
+from stg_engine.engine import PROVENANCE_FIELDS
 
 # --- Settings ---
 _CLI_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -449,7 +451,8 @@ def cmd_query(engine, pattern, limit=20):
                 reason = e.modifiers.get("virtual_reason", "")
                 mod += f', virtual={reason}'
             print(f"  [{e.source}]{arrow}[{e.target}] ::mod({mod})")
-            for line in _format_edge_modifiers(e, indent="    "):
+            mod_lines, _ = _format_edge_modifiers(e, indent="    ")
+            for line in mod_lines:
                 print(line)
 
 
@@ -1493,16 +1496,26 @@ def cmd_paths(engine, source, target):
     print(f"Path tension: {tension:.4f}")
 
 
-def _format_edge_modifiers(e, indent="      "):
-    """Format edge modifiers for display. Returns list of lines (empty if no modifiers)."""
-    lines = []
+def _format_edge_modifiers(e, indent="      ", show_provenance=False):
+    """Format edge modifiers for display.
+
+    Returns (lines, hidden_count). Provenance/audit fields (PROVENANCE_FIELDS in
+    stg_engine.engine — source, created_at, superseded_at, ...) are folded by
+    default; pass show_provenance=True to expand them. The hidden_count lets
+    callers print a summary footer.
+    """
+    lines: List[str] = []
+    hidden = 0
     if not e.modifiers:
-        return lines
+        return lines, hidden
     for k, v in e.modifiers.items():
         if k == "edge_class":
             continue  # already shown elsewhere
+        if not show_provenance and k in PROVENANCE_FIELDS:
+            hidden += 1
+            continue
         lines.append(f"{indent}{k}: {v}")
-    return lines
+    return lines, hidden
 
 
 def _resolve_node_name(engine, name):
@@ -1587,7 +1600,7 @@ def _format_edge_attrs(edge) -> str:
     return f" ({', '.join(parts)})" if parts else ""
 
 
-def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None):
+def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None, show_provenance=False):
     """Print full node detail with configurable indent.
 
     Extracted from cmd_node so community-mode propagate can inline
@@ -1596,6 +1609,9 @@ def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None)
     Virtual edges are filtered by default (show_virtual=False) — they are
     auto-generated structural bridges with no real description, and clutter
     the output. Count of hidden virtual edges is still reported.
+
+    Provenance fields (source/created_at/...) are folded by default to keep the
+    semantic core readable; pass show_provenance=True (cli: --full) to expand.
 
     If `limit` is set, only the first N edges in each direction are rendered
     (useful for high-degree nodes like `Jesus` with 470+ real edges).
@@ -1621,7 +1637,15 @@ def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None)
     if node.metadata:
         n_keys = len(node.metadata)
         plural = "key" if n_keys == 1 else "keys"
-        print(f"{pfx}  Properties: {n_keys} {plural} (use 'stg attrs {node.name}' to view)")
+        agent_flag = (
+            f"--agent {SETTINGS['agent']} "
+            if SETTINGS.get("agent", _DEFAULT_AGENT) != _DEFAULT_AGENT
+            else ""
+        )
+        print(
+            f"{pfx}  Properties: {n_keys} {plural} "
+            f"(use 'stg {agent_flag}attrs \"{node.name}\"' to view)"
+        )
 
     out_edges_all = engine.get_edges(source=name)
     in_edges_all = engine.get_edges(target=name)
@@ -1639,6 +1663,7 @@ def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None)
     in_shown = in_edges if limit is None else in_edges[:limit]
     out_truncated = len(out_edges) - len(out_shown)
     in_truncated = len(in_edges) - len(in_shown)
+    total_provenance_hidden = 0
     if out_edges:
         header = f"\n{pfx}  Outgoing ({len(out_edges)})"
         if limit is not None and len(out_edges) > limit:
@@ -1646,7 +1671,11 @@ def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None)
         print(f"{header}:")
         for e in out_shown:
             print(f"{pfx}    → [{e.target}]{_format_edge_attrs(e)}")
-            for line in _format_edge_modifiers(e, indent=mod_indent):
+            mod_lines, hidden = _format_edge_modifiers(
+                e, indent=mod_indent, show_provenance=show_provenance
+            )
+            total_provenance_hidden += hidden
+            for line in mod_lines:
                 print(line)
         if out_truncated:
             print(f"{pfx}    (+ {out_truncated} more outgoing edge(s) truncated, raise --limit to show)")
@@ -1659,16 +1688,29 @@ def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None)
         print(f"{header}:")
         for e in in_shown:
             print(f"{pfx}    ← [{e.source}]{_format_edge_attrs(e)}")
-            for line in _format_edge_modifiers(e, indent=mod_indent):
+            mod_lines, hidden = _format_edge_modifiers(
+                e, indent=mod_indent, show_provenance=show_provenance
+            )
+            total_provenance_hidden += hidden
+            for line in mod_lines:
                 print(line)
         if in_truncated:
             print(f"{pfx}    (+ {in_truncated} more incoming edge(s) truncated, raise --limit to show)")
     if in_virtual:
         print(f"{pfx}    (+ {in_virtual} virtual edge(s) hidden, use --virtual to show)")
+    if total_provenance_hidden and not show_provenance:
+        plural = "field" if total_provenance_hidden == 1 else "fields"
+        print(
+            f"{pfx}    (+ {total_provenance_hidden} provenance {plural} hidden "
+            f"[source/created_at/...], use --full to show)"
+        )
 
 
-def cmd_node(engine, name, show_virtual=False, limit=None):
-    _render_node_detail(engine, name, indent="", show_virtual=show_virtual, limit=limit)
+def cmd_node(engine, name, show_virtual=False, limit=None, show_provenance=False):
+    _render_node_detail(
+        engine, name, indent="",
+        show_virtual=show_virtual, limit=limit, show_provenance=show_provenance,
+    )
 
 
 def cmd_attrs(engine, args):
@@ -4496,7 +4538,8 @@ def main():
     elif cmd == "node" and len(sys.argv) >= 3:
         node_args = sys.argv[2:]
         show_virtual = "--virtual" in node_args
-        node_args = [a for a in node_args if a != "--virtual"]
+        show_provenance = "--full" in node_args
+        node_args = [a for a in node_args if a not in ("--virtual", "--full")]
         limit = None
         if "--limit" in node_args:
             idx = node_args.index("--limit")
@@ -4507,7 +4550,11 @@ def main():
                     pass
                 node_args = node_args[:idx] + node_args[idx + 2:]
         if node_args:
-            cmd_node(engine, node_args[0], show_virtual=show_virtual, limit=limit)
+            cmd_node(
+                engine, node_args[0],
+                show_virtual=show_virtual, limit=limit,
+                show_provenance=show_provenance,
+            )
     elif cmd == "ingest" and len(sys.argv) >= 3:
         args = sys.argv[2:]
         cognitive = "--cognitive" in args

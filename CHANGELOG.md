@@ -6,6 +6,71 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — `PROVENANCE_FIELDS` constant and provenance folding in `stg node`
+
+Edge modifiers in batch-ingested data tend to repeat verbatim across many
+edges of the same node — e.g. all 36 outgoing edges of `Elden_Ring` carrying
+`source="steam_appdetails"`. These provenance fields are audit-trail metadata,
+not semantic content, and crowd out the action / role / is_a fields that
+actually describe what the edge means.
+
+`stg node <name>` now folds provenance fields by default and prints a footer
+summarizing the count:
+
+```
+Outgoing (36):
+  → [FromSoftware_Inc]
+    action: developed_by
+  → [Bandai_Namco_Entertainment]
+    action: published_by
+  ...
+  (+ 36 provenance fields hidden [source/created_at/...], use --full to show)
+```
+
+Pass `--full` to expand them.
+
+Storage is unchanged — provenance still lives on the edge (audit and
+batch-rollback continue to work). This is purely a display-layer change.
+
+Implementation:
+
+- `engine.py`: new `PROVENANCE_FIELDS = frozenset({"source", "created_at",
+  "recorded_at", "superseded_at", "batch_id", "ingested_at"})`. Sibling to
+  `SEMANTIC_FIELDS` and `SUPERSEDE_SINGLE_VALUE_FIELDS`. `occurred_time` and
+  `author` are intentionally NOT in this set — they often carry semantic
+  content (event dates, attribution) rather than audit metadata.
+- `__init__.py`: export `PROVENANCE_FIELDS`.
+- `cli.py`: `_format_edge_modifiers(e, indent, show_provenance=False)` now
+  returns `(lines, hidden_count)`. Three call sites updated.
+  `_render_node_detail` accepts `show_provenance`, sums hidden across all
+  edges, and prints the footer when count > 0. `cmd_node` and the main
+  command dispatcher gain `--full` flag parsing.
+
+### Fixed — `Properties:` hint in `stg node` is now copy-paste runnable
+
+The hint shown after the properties summary used to be:
+
+```
+Properties: 32 keys (use 'stg attrs Elden_Ring' to view)
+```
+
+Two issues: (1) the agent flag was missing, so users on a non-default agent
+would have the suggested command run against the wrong `.stg`; (2) the node
+name was unquoted, which breaks for names with shell-special characters.
+
+Now emits, when on a non-default agent:
+
+```
+Properties: 32 keys (use 'stg --agent stg-steam attrs "Elden_Ring"' to view)
+```
+
+When on the default agent, the `--agent` flag is omitted but the node-name
+quoting remains (always shell-safe).
+
+Implementation in `cli.py:_render_node_detail`. Test
+`test_cli_node_renders_properties_summary` updated to tolerate optional
+`--agent` injection from `STG_AGENT` env var.
+
 ## [0.5.0a7] — 2026-05-10
 
 ### Added — Intrinsic-property self-loop edges (STL Protocol §9.4)
