@@ -201,3 +201,73 @@ def test_intrinsic_edge_does_not_contribute_community_heat():
 
     # Should not crash; intrinsic edge contributes zero heat regardless of last_used
     assert isinstance(signals, dict)
+
+
+# ─── CLI node detail rendering (1B) ──────────────────────────────────────
+
+def test_cli_node_renders_properties_section(capsys):
+    """`stg node <name>` shows intrinsic attrs as Properties:, not as edges."""
+    from stg_engine.cli import _render_node_detail
+
+    e = STGEngine()
+    _ingest_intrinsic(e, "Elden_Ring",
+                      appid="1245620", release_year="2022", price_usd="59.99")
+    e.ingest_stl('[Elden_Ring] -> [Souls_Like] ::mod(action="has_tag", confidence=0.95)')
+
+    _render_node_detail(e, "Elden_Ring")
+    out = capsys.readouterr().out
+
+    # Properties section exists with each attribute
+    assert "Properties:" in out
+    assert "appid: 1245620" in out
+    assert "release_year: 2022" in out
+    assert "price_usd: 59.99" in out
+
+
+def test_cli_node_excludes_intrinsic_from_outgoing(capsys):
+    """Intrinsic self-loop must not appear in Outgoing/Incoming sections."""
+    from stg_engine.cli import _render_node_detail
+
+    e = STGEngine()
+    _ingest_intrinsic(e, "Elden_Ring", appid="1245620")
+    e.ingest_stl('[Elden_Ring] -> [Souls_Like] ::mod(action="has_tag", confidence=0.95)')
+    e.ingest_stl('[Elden_Ring] -> [Action_RPG] ::mod(action="has_tag", confidence=0.95)')
+
+    _render_node_detail(e, "Elden_Ring")
+    out = capsys.readouterr().out
+
+    # Outgoing count must be 2 (real edges only), not 3
+    assert "Outgoing (2)" in out
+    # Self-loop arrow must not appear
+    assert "→ [Elden_Ring]" not in out
+
+
+def test_cli_node_suppresses_carrier_metadata(capsys):
+    """action/rule/edge_class/_epistemic_warnings should not show in Properties."""
+    from stg_engine.cli import _render_node_detail
+
+    e = STGEngine()
+    _ingest_intrinsic(e, "Foo", visible_attr="should_show")
+
+    _render_node_detail(e, "Foo")
+    out = capsys.readouterr().out
+
+    # Real attribute shows
+    assert "visible_attr: should_show" in out
+    # Carrier-internal fields suppressed
+    assert "action: intrinsic_properties" not in out
+    assert "rule: definitional" not in out
+    assert "edge_class:" not in out
+
+
+def test_cli_node_no_properties_section_when_no_intrinsic(capsys):
+    """Nodes without intrinsic edges render no Properties: section."""
+    from stg_engine.cli import _render_node_detail
+
+    e = STGEngine()
+    e.ingest_stl('[A] -> [B] ::mod(action="related", confidence=0.9)')
+
+    _render_node_detail(e, "A")
+    out = capsys.readouterr().out
+
+    assert "Properties:" not in out

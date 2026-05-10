@@ -1584,6 +1584,25 @@ def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None)
 
     out_edges_all = engine.get_edges(source=name)
     in_edges_all = engine.get_edges(target=name)
+
+    # STL Protocol §9.4: intrinsic-property self-loops are attribute carriers,
+    # not relationships. Pull them out for separate Properties: rendering and
+    # exclude from outgoing/incoming lists. They appear in both lists because
+    # source == target; the same edge is shown only once under Properties.
+    intrinsic_edges = [e for e in out_edges_all if e.is_intrinsic_property()]
+    if intrinsic_edges:
+        out_edges_all = [e for e in out_edges_all if not e.is_intrinsic_property()]
+        in_edges_all = [e for e in in_edges_all if not e.is_intrinsic_property()]
+        # Render Properties section before outgoing/incoming
+        print(f"\n{pfx}  Properties:")
+        # Carrier-internal modifier keys to suppress from the user view
+        _carrier_keys = {"action", "rule", "edge_class", "_epistemic_warnings"}
+        for e in intrinsic_edges:
+            for k, v in e.modifiers.items():
+                if k in _carrier_keys:
+                    continue
+                print(f"{pfx}    {k}: {v}")
+
     if show_virtual:
         out_edges, in_edges = out_edges_all, in_edges_all
         out_virtual = in_virtual = 0
