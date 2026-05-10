@@ -887,7 +887,7 @@ Subjective claims by users (e.g. "I had an amazing time", "meditation healed me"
 | **STG-as-a-Pointer** | Detail is in a `.md` file; STG stores a one-line summary + path | `path=`, `description=` (one sentence) |
 | **STG-as-an-Event** | The full content fits on the edge | `description=` or `lesson=`, `occurred_time=`, `rule="empirical"` |
 | **STG-as-a-Skill** | Edge is an executable script registration | `path=`, `executable="true"`, `interpreter=`, `args_template=`, `timeout_s=` (see §Skills) |
-| **STG-as-a-Property-Carrier** | Self-loop edge holds node-identity attributes; not a relationship | `action="intrinsic_properties"`, free-form attribute keys, `rule="definitional"` |
+| **STG-as-a-Property-Carrier** | Self-loop **surface syntax** for node attributes — engine materializes to `node.metadata`, no edge is created | `action="intrinsic_properties"`, free-form attribute keys |
 
 Threshold: if your content is more than 2-3 sentences → write a `.md`, store the path. If a single `lesson=` clause says it → keep it on the edge. If it's a runnable operation → make it a Skill. If a node has many attributes that would otherwise repeat across every outgoing edge → use a Property-Carrier self-loop.
 
@@ -900,7 +900,11 @@ Threshold: if your content is more than 2-3 sentences → write a `.md`, store t
 )
 ```
 
-Runtime: such self-loops are excluded from `propagate` and gravity community detection — the engine treats them as storage-only attribute bags. They appear as a `Properties:` section in `stg node <name>`. See STL Operational Protocol §9.4 for the full contract.
+**What happens at ingest:** `ingest_stl` detects self-loop + `action="intrinsic_properties"`, strips carrier keys (`action`, `edge_class`), and calls `add_node(**remaining_modifiers)`. The attributes land in `nodes.metadata_json`; **no graph edge is created**. `confidence`, `rule`, etc. are accepted for STL syntactic completeness but discarded (they are edge fields, and there is no edge).
+
+**Retrieval:** `stg node <name>` renders attributes as a `Properties:` section. Programmatic access via `engine._nodes[key].metadata` or SQLite `JSON_EXTRACT(metadata_json, '$.appid')`.
+
+**Defensive filter:** propagate / gravity additionally skip any self-loop intrinsic-property edges that exist in the graph (e.g. from legacy `.stg` files predating commit `7a94bb4`, or manual `add_edge` calls). Such edges should not exist in graphs ingested via `ingest_stl` after 2026-05-10. See STL Operational Protocol §9.4 for the full contract.
 
 ### Validation
 
