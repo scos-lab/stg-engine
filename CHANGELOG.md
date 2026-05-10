@@ -6,6 +6,60 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — Namespace-aware `stg dump` and `stg query`
+
+Namespace is now a first-class browsing primitive across both inspection
+commands, complementing the attribute-focused `stg attrs --namespace`
+shipped in 0.6.0a1.
+
+`stg dump` (commit `82f59d4`):
+
+```
+[1] Game:Elden_Ring | [Game_Hub]
+    out [Game:Elden_Ring] -> [Tag:Souls_Like]
+    out [Game:Elden_Ring] -> [Studio:FromSoftware]
+```
+
+Every node line and every edge endpoint now renders with `Namespace:Name`
+prefix (matching STL syntax — copy-paste friendly). New `--namespace <ns>`
+flag scopes the listing.
+
+`stg query` (commit `5fdfc4f`) — pattern grammar extended:
+
+```
+stg query <text>          # whole-graph fuzzy on name (unchanged)
+stg query <ns>:           # list every node in <ns> namespace
+stg query <ns>:<text>     # fuzzy match on name, scoped to <ns>
+```
+
+Output uses the same `Namespace:Name` prefix in node listings and edge
+endpoints. When a namespace is given, the Related-edges section is
+filtered to edges that touch that namespace, suppressing cross-namespace
+mentions of the name.
+
+Why now: §9.4 v2 (intrinsic-properties materialize to node.metadata) and
+§10 plan Z (namespace = classification tag, not identity) both raise
+the importance of "browse by category" workflows — `stg query Game:`,
+`stg query Studio:`, `stg query Bug:` are now one-line entry points.
+
+Engine API: `STGEngine.query_nodes()` accepts a new `namespace` parameter
+(AND-composes with existing `name_pattern`, `anchor_type`, `min_tension`).
+
+### Fixed — Namespace comparisons are now case-insensitive
+
+User-reported regression: `stg query game:` returned no matches even
+though the agent had `Game`-namespace nodes. Cause was exact string
+equality in namespace filters. Aligned with the long-standing case
+treatment of node names (engine `_nk` normalizes to lower).
+
+All 6 namespace-comparison sites now match without case sensitivity
+(both Python paths and the SQL passthrough in `query_node_attrs_sql`,
+which uses `LOWER(namespace) = LOWER(?)`). Canonical casing from ingest
+is preserved in display.
+
+Affected commands: `stg query <ns>:`, `stg dump --namespace`,
+`stg attrs --namespace`. Commit `ab3bc68`.
+
 ## [0.6.0a1] — 2026-05-10
 
 ### Changed (BREAKING) — STL Protocol §9.4 v2: materialize intrinsic-property self-loops to node attributes
