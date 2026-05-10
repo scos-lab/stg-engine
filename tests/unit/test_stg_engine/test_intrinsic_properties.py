@@ -208,8 +208,12 @@ def test_gravity_unaffected_by_intrinsic_ingest():
 
 # ─── CLI node detail rendering (Properties: section reads metadata) ────────
 
-def test_cli_node_renders_properties_section(capsys):
-    """`stg node <name>` shows node.metadata as a Properties: section."""
+def test_cli_node_renders_properties_summary(capsys):
+    """`stg node <name>` shows a count summary, not the full attribute values.
+
+    Minimalism: node detail focuses on graph topology. Use `stg attrs <name>`
+    for the full attribute listing.
+    """
     from stg_engine.cli import _render_node_detail
 
     e = STGEngine()
@@ -220,10 +224,24 @@ def test_cli_node_renders_properties_section(capsys):
     _render_node_detail(e, "Elden_Ring")
     out = capsys.readouterr().out
 
-    assert "Properties:" in out
-    assert "appid: 1245620" in out
-    assert "release_year: 2022" in out
-    assert "price_usd: 59.99" in out
+    # Summary line shows count + redirect to `stg attrs`
+    assert "Properties: 3 keys" in out
+    assert "stg attrs Elden_Ring" in out
+    # Values are NOT printed in node detail
+    assert "appid: 1245620" not in out
+    assert "release_year: 2022" not in out
+
+
+def test_cli_node_properties_summary_singular(capsys):
+    """One attribute renders as '1 key', not '1 keys'."""
+    from stg_engine.cli import _render_node_detail
+
+    e = STGEngine()
+    _ingest_intrinsic(e, "Foo", only_one="value")
+
+    _render_node_detail(e, "Foo")
+    out = capsys.readouterr().out
+    assert "Properties: 1 key " in out
 
 
 def test_cli_node_no_self_loop_in_outgoing(capsys):
@@ -242,18 +260,18 @@ def test_cli_node_no_self_loop_in_outgoing(capsys):
     assert "→ [Elden_Ring]" not in out
 
 
-def test_cli_node_properties_excludes_carrier_keys(capsys):
-    """Properties section displays only user-facing attrs (carrier keys stripped at ingest)."""
-    from stg_engine.cli import _render_node_detail
+def test_cli_attrs_excludes_carrier_keys(capsys):
+    """`stg attrs <node>` lists only user-facing attrs — carrier keys never
+    reach metadata at ingest time, so they don't appear here either."""
+    from stg_engine.cli import cmd_attrs
 
     e = STGEngine()
     _ingest_intrinsic(e, "Foo", visible_attr="should_show")
 
-    _render_node_detail(e, "Foo")
+    cmd_attrs(e, ["Foo"])
     out = capsys.readouterr().out
 
     assert "visible_attr: should_show" in out
-    # Carrier keys never reached metadata, so they're absent here too
     assert "action: intrinsic_properties" not in out
     assert "edge_class:" not in out
 
@@ -582,3 +600,115 @@ def test_cli_attrs_unknown_flag(capsys):
     cmd_attrs(e, ["--bogus", "value"])
     out = capsys.readouterr().out
     assert "Unknown flag" in out
+
+
+# ─── --keys discovery ──────────────────────────────────────────────────────
+
+def test_query_metadata_keys_whole_graph():
+    e = _make_steam_engine()
+    items = e.query_metadata_keys()
+    keys = [k for k, _, _ in items]
+    assert set(keys) == {"appid", "release_year", "price_usd"}
+
+
+def test_query_metadata_keys_coverage_reflects_partial_presence():
+    """Counter_Strike_2 has no price_usd → coverage 2/3, not 3/3."""
+    e = _make_steam_engine()
+    items = e.query_metadata_keys(namespace="Game")
+    by_key = {k: (count, total) for k, count, total in items}
+    assert by_key["appid"] == (3, 3)
+    assert by_key["release_year"] == (3, 3)
+    assert by_key["price_usd"] == (2, 3)
+
+
+def test_query_metadata_keys_sort_order():
+    """Sort by count desc, then key alpha."""
+    e = _make_steam_engine()
+    items = e.query_metadata_keys(namespace="Game")
+    # appid + release_year both have count 3, alphabetical → appid first
+    assert items[0][0] == "appid"
+    assert items[1][0] == "release_year"
+    assert items[2][0] == "price_usd"  # count 2, comes last
+
+
+def test_query_metadata_keys_namespace_isolation():
+    e = _make_steam_engine()
+    e.ingest_stl(
+        '[Movie:Avatar2] -> [Movie:Avatar2] ::mod('
+        'action="intrinsic_properties", director="Cameron", year="2022")'
+    )
+
+    movie_keys = {k for k, _, _ in e.query_metadata_keys(namespace="Movie")}
+    game_keys = {k for k, _, _ in e.query_metadata_keys(namespace="Game")}
+    assert movie_keys == {"director", "year"}
+    assert "director" not in game_keys
+
+
+def test_query_metadata_keys_single_node():
+    e = _make_steam_engine()
+    items = e.query_metadata_keys(node_name="Elden_Ring")
+    keys = [k for k, _, _ in items]
+    # All Elden_Ring's keys, alphabetical, with count=1, total=1
+    assert keys == ["appid", "price_usd", "release_year"]
+    assert all(count == 1 and total == 1 for _, count, total in items)
+
+
+def test_query_metadata_keys_empty_when_no_metadata():
+    e = STGEngine()
+    e.add_node("BareNode")
+    assert e.query_metadata_keys() == []
+    assert e.query_metadata_keys(node_name="BareNode") == []
+    assert e.query_metadata_keys(node_name="Nonexistent") == []
+
+
+def test_cli_attrs_keys_whole_graph(capsys):
+    from stg_engine.cli import cmd_attrs
+    e = _make_steam_engine()
+    cmd_attrs(e, ["--keys"])
+    out = capsys.readouterr().out
+    assert "Field" in out
+    assert "Coverage" in out
+    assert "appid" in out
+    assert "3/3" in out
+    assert "price_usd" in out
+    assert "2/3" in out  # partial coverage
+    assert "(3 unique keys across 3 nodes)" in out
+
+
+def test_cli_attrs_keys_namespace(capsys):
+    from stg_engine.cli import cmd_attrs
+    e = _make_steam_engine()
+    cmd_attrs(e, ["--namespace", "Game", "--keys"])
+    out = capsys.readouterr().out
+    assert "in namespace 'Game'" in out
+
+
+def test_cli_attrs_keys_single_node(capsys):
+    """Node-level --keys lists keys without values, no coverage table."""
+    from stg_engine.cli import cmd_attrs
+    e = _make_steam_engine()
+    cmd_attrs(e, ["Elden_Ring", "--keys"])
+    out = capsys.readouterr().out
+    assert "Node: Elden_Ring" in out
+    assert "  appid" in out
+    assert "  release_year" in out
+    # Values must NOT appear (this is keys-only mode)
+    assert "1245620" not in out
+    assert "Coverage" not in out
+
+
+def test_cli_attrs_keys_empty_namespace(capsys):
+    from stg_engine.cli import cmd_attrs
+    e = _make_steam_engine()
+    cmd_attrs(e, ["--namespace", "DoesNotExist", "--keys"])
+    out = capsys.readouterr().out
+    assert "No metadata keys found" in out
+
+
+def test_cli_attrs_keys_node_without_metadata(capsys):
+    from stg_engine.cli import cmd_attrs
+    e = STGEngine()
+    e.add_node("Bare")
+    cmd_attrs(e, ["Bare", "--keys"])
+    out = capsys.readouterr().out
+    assert "no metadata keys" in out

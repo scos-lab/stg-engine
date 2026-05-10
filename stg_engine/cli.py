@@ -1615,11 +1615,13 @@ def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None)
 
     # STL Protocol §9.4: node attributes (materialized from intrinsic-property
     # self-loops, or written by other ingest paths like markdown_extractor)
-    # are rendered as a multi-line Properties: section.
+    # are summarized here with a count; `stg attrs <name>` lists them in full.
+    # Default minimalism — node detail focuses on graph topology, attributes
+    # are queried explicitly when needed.
     if node.metadata:
-        print(f"\n{pfx}  Properties:")
-        for k, v in node.metadata.items():
-            print(f"{pfx}    {k}: {v}")
+        n_keys = len(node.metadata)
+        plural = "key" if n_keys == 1 else "keys"
+        print(f"{pfx}  Properties: {n_keys} {plural} (use 'stg attrs {node.name}' to view)")
 
     out_edges_all = engine.get_edges(source=name)
     in_edges_all = engine.get_edges(target=name)
@@ -1670,7 +1672,7 @@ def cmd_node(engine, name, show_virtual=False, limit=None):
 
 
 def cmd_attrs(engine, args):
-    """Query node attributes (materialized from intrinsic-property self-loops
+    r"""Query node attributes (materialized from intrinsic-property self-loops
     or other ingest paths that write to node.metadata).
 
     Usage:
@@ -1678,21 +1680,28 @@ def cmd_attrs(engine, args):
         stg attrs --namespace <ns>             # all nodes in namespace
         stg attrs --field key=value [...]      # field filter (multiple, AND)
         stg attrs --where "<sql>"              # SQL where on metadata_json
+        stg attrs --keys                       # discover available metadata keys
         stg attrs --limit N                    # truncate output
 
-    Combinable: --namespace can stack with --field or --where.
+    Combinable:
+        --namespace stacks with --field, --where, or --keys.
+        --keys with a node argument lists that node's keys.
 
     Examples:
         stg attrs Elden_Ring
         stg attrs --namespace Game
         stg attrs --namespace Game --field release_year=2022
-        stg attrs --where "JSON_EXTRACT(metadata_json,'\$.release_year')>'2020'"
+        stg attrs --where "JSON_EXTRACT(metadata_json,'$.release_year')>'2020'"
+        stg attrs --keys                          # all keys in graph
+        stg attrs --namespace Game --keys         # keys + coverage in namespace
+        stg attrs Elden_Ring --keys               # just the keys, no values
     """
     namespace = None
     field_filters: Dict[str, str] = {}
     where_clause = None
     limit = None
     target = None
+    keys_only = False
 
     i = 0
     while i < len(args):
@@ -1711,6 +1720,9 @@ def cmd_attrs(engine, args):
         elif a == "--where" and i + 1 < len(args):
             where_clause = args[i + 1]
             i += 2
+        elif a == "--keys":
+            keys_only = True
+            i += 1
         elif a == "--limit" and i + 1 < len(args):
             try:
                 limit = int(args[i + 1])
@@ -1724,6 +1736,36 @@ def cmd_attrs(engine, args):
         else:
             target = a
             i += 1
+
+    # ─── --keys discovery mode ─────────────────────────────────────────
+    if keys_only:
+        if target:
+            # Node-level: list this node's keys (no values, no coverage)
+            items = engine.query_metadata_keys(node_name=target)
+            if not items:
+                print(f"Node '{target}' has no metadata keys.")
+                return
+            print(f"Node: {target}")
+            for k, _, _ in items:
+                print(f"  {k}")
+            return
+        # Scope-level: namespace or whole graph, with coverage table
+        items = engine.query_metadata_keys(namespace=namespace)
+        if not items:
+            scope_desc = f"namespace '{namespace}'" if namespace else "graph"
+            print(f"No metadata keys found in {scope_desc}.")
+            return
+        total = items[0][2]
+        FIELD_W = max((len(k) for k, _, _ in items), default=5)
+        FIELD_W = max(FIELD_W, len("Field"))
+        print(f"{'Field':<{FIELD_W}} | Coverage")
+        print("─" * (FIELD_W + 14))
+        for k, count, _ in items:
+            pct = round(100 * count / total)
+            print(f"{k:<{FIELD_W}} | {count}/{total} ({pct}%)")
+        scope_desc = f" in namespace '{namespace}'" if namespace else ""
+        print(f"\n({len(items)} unique keys across {total} nodes{scope_desc})")
+        return
 
     # ─── Single-node mode ──────────────────────────────────────────────
     if target and not (namespace or field_filters or where_clause):

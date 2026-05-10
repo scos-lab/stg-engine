@@ -735,6 +735,58 @@ class STGEngine:
         results.sort(key=lambda n: n.name.lower())
         return results
 
+    def query_metadata_keys(
+        self,
+        namespace: Optional[str] = None,
+        node_name: Optional[str] = None,
+    ) -> List[Tuple[str, int, int]]:
+        """Discover the metadata key universe — what attributes exist?
+
+        Schema-less JSON metadata makes ad-hoc key discovery essential: unlike
+        a relational table where columns are fixed, two nodes in the same
+        namespace may carry different field sets. This method enumerates the
+        keys actually present and reports per-key coverage.
+
+        Args:
+            node_name: If set, scope is just that single node.
+            namespace: If set (and node_name is None), scope is all nodes in
+                that namespace with non-empty metadata.
+            (both None): Scope is all nodes in the graph with non-empty metadata.
+
+        Returns:
+            List of (key, count, total), where:
+            - count = number of in-scope nodes that have this key
+            - total = total number of in-scope nodes
+            Sorted by count descending, then key ascending. Empty list when
+            scope is empty or no metadata present.
+        """
+        if node_name is not None:
+            node = self.get_node(node_name)
+            if node is None or not node.metadata:
+                return []
+            return [(k, 1, 1) for k in sorted(node.metadata.keys())]
+
+        if namespace is not None:
+            scope = [
+                n for n in self._nodes.values()
+                if n.namespace == namespace and n.metadata
+            ]
+        else:
+            scope = [n for n in self._nodes.values() if n.metadata]
+
+        total = len(scope)
+        if total == 0:
+            return []
+
+        counts: Dict[str, int] = {}
+        for n in scope:
+            for k in n.metadata.keys():
+                counts[k] = counts.get(k, 0) + 1
+
+        items = [(k, c, total) for k, c in counts.items()]
+        items.sort(key=lambda kct: (-kct[1], kct[0]))
+        return items
+
     def query_node_attrs_sql(
         self,
         where_clause: str,
