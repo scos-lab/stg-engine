@@ -1612,29 +1612,17 @@ def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None)
     print(f"{pfx}  Tension: {node.tension:.4f}")
     print(f"{pfx}  Activation: {node.activation:.4f}")
     print(f"{pfx}  Self-Relevance: {node.self_relevance:.4f}")
+
+    # STL Protocol §9.4: node attributes (materialized from intrinsic-property
+    # self-loops, or written by other ingest paths like markdown_extractor)
+    # are rendered as a multi-line Properties: section.
     if node.metadata:
-        print(f"{pfx}  Metadata: {node.metadata}")
+        print(f"\n{pfx}  Properties:")
+        for k, v in node.metadata.items():
+            print(f"{pfx}    {k}: {v}")
 
     out_edges_all = engine.get_edges(source=name)
     in_edges_all = engine.get_edges(target=name)
-
-    # STL Protocol §9.4: intrinsic-property self-loops are attribute carriers,
-    # not relationships. Pull them out for separate Properties: rendering and
-    # exclude from outgoing/incoming lists. They appear in both lists because
-    # source == target; the same edge is shown only once under Properties.
-    intrinsic_edges = [e for e in out_edges_all if e.is_intrinsic_property()]
-    if intrinsic_edges:
-        out_edges_all = [e for e in out_edges_all if not e.is_intrinsic_property()]
-        in_edges_all = [e for e in in_edges_all if not e.is_intrinsic_property()]
-        # Render Properties section before outgoing/incoming
-        print(f"\n{pfx}  Properties:")
-        # Carrier-internal modifier keys to suppress from the user view
-        _carrier_keys = {"action", "rule", "edge_class", "_epistemic_warnings"}
-        for e in intrinsic_edges:
-            for k, v in e.modifiers.items():
-                if k in _carrier_keys:
-                    continue
-                print(f"{pfx}    {k}: {v}")
 
     if show_virtual:
         out_edges, in_edges = out_edges_all, in_edges_all

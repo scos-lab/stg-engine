@@ -761,6 +761,46 @@ class STGEngine:
     # STL Import
     # ═══════════════════════════════════════════════════════════
 
+    # Modifier keys that describe the intrinsic-properties edge "carrier"
+    # itself rather than user-facing node attributes — strip before merging
+    # into node.metadata.
+    _INTRINSIC_CARRIER_KEYS = frozenset({
+        "action",         # always "intrinsic_properties" — the trigger value
+        "edge_class",     # storage hint for edge class, n/a after materialization
+    })
+
+    def _try_materialize_intrinsic_properties(
+        self,
+        src_name: str,
+        src_ns: Optional[str],
+        tgt_name: str,
+        modifiers: Dict[str, Any],
+    ) -> bool:
+        """If this STL statement is a self-loop with action="intrinsic_properties",
+        materialize the modifiers into the source node's metadata and return True.
+
+        Returns False if the statement should proceed with normal edge ingest.
+
+        STL Operational Protocol §9.4: self-loops marked with
+        action="intrinsic_properties" are surface syntax for node-level
+        attributes. The graph edge is not created; modifiers are written to
+        nodes.metadata_json instead. confidence/strength/rule/time are edge-
+        level fields and have no meaning here, so they are discarded (already
+        popped from `modifiers` by the caller before this point).
+        """
+        if self._nk(src_name) != self._nk(tgt_name):
+            return False
+        if modifiers.get("action") != "intrinsic_properties":
+            return False
+
+        attrs = {
+            k: v for k, v in modifiers.items()
+            if k not in self._INTRINSIC_CARRIER_KEYS
+        }
+        # add_node merges into existing node.metadata when the node already exists
+        self.add_node(src_name, namespace=src_ns, **attrs)
+        return True
+
     def ingest_stl(
         self,
         stl_text: str,
@@ -838,6 +878,14 @@ class STGEngine:
                         created_at = _parse_dt(timestamp_str).timestamp()
                     except (ValueError, ImportError):
                         pass  # keep timestamp as modifier, don't set created_at
+
+            # STL Protocol §9.4: self-loop with action="intrinsic_properties"
+            # is surface syntax for node attributes. Materialize to
+            # node.metadata, do not create an edge.
+            if self._try_materialize_intrinsic_properties(
+                src_name, src_ns, tgt_name, modifiers,
+            ):
+                continue
 
             self.add_node(src_name, namespace=src_ns)
             self.add_node(tgt_name, namespace=tgt_ns)
@@ -953,6 +1001,12 @@ class STGEngine:
                         edge_created_at = _parse_dt(timestamp_str).timestamp()
                     except (ValueError, ImportError):
                         pass
+
+            # STL Protocol §9.4: see ingest_stl for the rationale.
+            if self._try_materialize_intrinsic_properties(
+                src_name, src_ns, tgt_name, modifiers,
+            ):
+                continue
 
             self.add_node(src_name, namespace=src_ns)
             self.add_node(tgt_name, namespace=tgt_ns)
