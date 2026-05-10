@@ -456,18 +456,28 @@ def cmd_query(engine, pattern, limit=20):
                 print(line)
 
 
-def cmd_dump(engine, page_size=100, start=0):
+def cmd_dump(engine, page_size=100, start=0, namespace=None):
     """Paginated dump of all nodes and their related edges.
 
     Sorted by node name. Each page shows `page_size` nodes; after each page the
     user is prompted to continue (ENTER), jump to a node (number), or quit (q).
+
+    Args:
+        namespace: If set, only nodes whose `namespace` field matches this
+            string are dumped. Edges referencing such nodes still display
+            their endpoints with full namespace prefixes.
     """
     all_nodes = sorted(engine._nodes.values(), key=lambda n: n.name.lower())
+    if namespace is not None:
+        all_nodes = [n for n in all_nodes if n.namespace == namespace]
     total_nodes = len(all_nodes)
     total_edges = len(engine._edges)
 
     if total_nodes == 0:
-        print("Graph is empty.")
+        if namespace is not None:
+            print(f"No nodes in namespace '{namespace}'.")
+        else:
+            print("Graph is empty.")
         return
 
     # Build node -> edges index (both directions) for O(1) lookup per node.
@@ -479,7 +489,16 @@ def cmd_dump(engine, page_size=100, start=0):
         if e.target.lower() != e.source.lower():
             edge_index.setdefault(e.target.lower(), []).append(("in", e))
 
-    print(f"Dumping {total_nodes} nodes / {total_edges} edges (page size {page_size})")
+    # Helper: format a name with its namespace prefix when available.
+    # Node name lookup mirrors engine._nk normalization (lower + hyphen→_).
+    def _ns_label(name: str) -> str:
+        node = engine._nodes.get(name.lower().replace("-", "_"))
+        if node and node.namespace:
+            return f"{node.namespace}:{name}"
+        return name
+
+    scope_msg = f" in namespace '{namespace}'" if namespace else ""
+    print(f"Dumping {total_nodes} nodes{scope_msg} / {total_edges} edges (page size {page_size})")
     print()
 
     idx = max(0, start)
@@ -488,7 +507,8 @@ def cmd_dump(engine, page_size=100, start=0):
         print(f"=== Nodes {idx + 1}-{end} / {total_nodes} ===")
         for i in range(idx, end):
             n = all_nodes[i]
-            parts = [f"[{i + 1}] {n.name}"]
+            display = f"{n.namespace}:{n.name}" if n.namespace else n.name
+            parts = [f"[{i + 1}] {display}"]
             if n.tension > 0:
                 parts.append(f"T={n.tension:.3f}")
             if n.activation > 0:
@@ -512,7 +532,9 @@ def cmd_dump(engine, page_size=100, start=0):
                     reason = e.modifiers.get("virtual_reason", "")
                     mod += f", virtual={reason}"
                 tag = "  out" if direction == "out" else "  in "
-                print(f"  {tag} [{e.source}]{arrow}[{e.target}] ::mod({mod})")
+                src_label = _ns_label(e.source)
+                tgt_label = _ns_label(e.target)
+                print(f"  {tag} [{src_label}]{arrow}[{tgt_label}] ::mod({mod})")
                 desc = e.modifiers.get("description") or e.modifiers.get("lesson")
                 if desc:
                     if len(desc) > 120:
@@ -4392,6 +4414,7 @@ def main():
         args = sys.argv[2:]
         page_size = 100
         start = 0
+        namespace = None
         if "--page" in args:
             idx = args.index("--page")
             if idx + 1 < len(args):
@@ -4406,7 +4429,11 @@ def main():
                     start = int(args[idx + 1]) - 1
                 except ValueError:
                     pass
-        cmd_dump(engine, page_size=page_size, start=start)
+        if "--namespace" in args:
+            idx = args.index("--namespace")
+            if idx + 1 < len(args):
+                namespace = args[idx + 1]
+        cmd_dump(engine, page_size=page_size, start=start, namespace=namespace)
     elif cmd == "query" and len(sys.argv) >= 3:
         # Parse --limit N flag
         args = sys.argv[2:]

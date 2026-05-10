@@ -715,3 +715,80 @@ def test_cli_attrs_keys_node_without_metadata(capsys):
     cmd_attrs(e, ["Bare", "--keys"])
     out = capsys.readouterr().out
     assert "no metadata keys" in out
+
+
+# ─── stg dump namespace display + filter ───────────────────────────────────
+
+def test_cli_dump_shows_namespace_prefix(capsys, monkeypatch):
+    """Node lines and edge endpoints both render with `Namespace:Name`."""
+    from stg_engine.cli import cmd_dump
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "q")
+
+    e = STGEngine()
+    e.ingest_stl(
+        '[Game:Elden_Ring] -> [Tag:Souls_Like] ::mod(action="has_tag", confidence=0.95)\n'
+        '[Game:Elden_Ring] -> [Studio:FromSoftware] ::mod(action="developed_by")\n'
+    )
+    cmd_dump(e, page_size=10)
+    out = capsys.readouterr().out
+
+    # Node lines show namespace prefix
+    assert "Game:Elden_Ring" in out
+    assert "Tag:Souls_Like" in out
+    assert "Studio:FromSoftware" in out
+    # Edge endpoints carry the prefix too
+    assert "[Game:Elden_Ring] -> [Tag:Souls_Like]" in out
+    assert "[Game:Elden_Ring] -> [Studio:FromSoftware]" in out
+
+
+def test_cli_dump_namespace_filter(capsys, monkeypatch):
+    """--namespace narrows the node-listing scope; edges still show full prefixes."""
+    from stg_engine.cli import cmd_dump
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "q")
+
+    e = STGEngine()
+    e.ingest_stl(
+        '[Game:Elden_Ring] -> [Tag:Souls_Like] ::mod(action="has_tag")\n'
+        '[Game:Stardew_Valley] -> [Tag:Farming] ::mod(action="has_tag")\n'
+    )
+    cmd_dump(e, page_size=10, namespace="Game")
+    out = capsys.readouterr().out
+
+    assert "in namespace 'Game'" in out
+    assert "Game:Elden_Ring" in out
+    assert "Game:Stardew_Valley" in out
+    # Tag nodes are not listed as standalone entries (they aren't in Game ns),
+    # but they still appear as edge endpoints under the Game nodes.
+    assert "[Tag:Souls_Like]" in out  # as edge endpoint
+    # No standalone "[N] Tag:..." line — they are not Game-namespace nodes
+    lines = out.split("\n")
+    standalone_tag_lines = [
+        l for l in lines
+        if l.startswith("[") and "Tag:" in l and "->" not in l
+    ]
+    assert standalone_tag_lines == []
+
+
+def test_cli_dump_namespace_no_match(capsys):
+    """Empty namespace gives a clear message, no traceback."""
+    from stg_engine.cli import cmd_dump
+    e = STGEngine()
+    e.ingest_stl('[Game:X] -> [Game:Y] ::mod(action="related")')
+    cmd_dump(e, page_size=10, namespace="DoesNotExist")
+    out = capsys.readouterr().out
+    assert "No nodes in namespace 'DoesNotExist'" in out
+
+
+def test_cli_dump_no_namespace_omits_prefix(capsys, monkeypatch):
+    """Nodes without a namespace render bare (no leading colon)."""
+    from stg_engine.cli import cmd_dump
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "q")
+
+    e = STGEngine()
+    e.add_edge("Plain_Node", "Other", confidence=0.9)
+    cmd_dump(e, page_size=10)
+    out = capsys.readouterr().out
+
+    # No "namespace:" prefix when namespace is None
+    assert "Plain_Node" in out
+    assert ":Plain_Node" not in out
