@@ -183,7 +183,7 @@ class StarMapRenderer:
         # Build node data
         nodes_data = []
         for name in node_names:
-            node = engine._nodes.get(name)
+            node = engine._nodes.get(engine._nk(name))
             ns = node.namespace if node else None
             color = NAMESPACE_COLORS.get(ns, DEFAULT_NODE_COLOR) if ns else DEFAULT_NODE_COLOR
 
@@ -284,7 +284,9 @@ class StarMapRenderer:
         filter_dead_ends: bool = False,
     ) -> Tuple[List[str], List[Tuple[str, str]]]:
         """Full graph. Optionally filter degree-1 nodes."""
-        all_nodes = set(engine._nodes.keys())
+        # Use display names so node ids match edge endpoints (STGEdge stores
+        # source/target as display names; engine._nodes keys are normalized).
+        all_nodes = {node.name for node in engine._nodes.values()}
         all_edges = [(e.source, e.target) for e in engine._edges]
 
         if filter_dead_ends:
@@ -374,11 +376,13 @@ class StarMapRenderer:
             activated_names = engine.propagate(config.propagate_query)
             if not activated_names:
                 return None
-            activation = {
-                n: engine._nodes[n].activation
-                for n in activated_names
-                if n in engine._nodes
-            }
+            # propagate() returns display names; engine._nodes is keyed by
+            # normalized form, so look up via _nk.
+            activation: Dict[str, float] = {}
+            for n in activated_names:
+                node = engine._nodes.get(engine._nk(n))
+                if node is not None:
+                    activation[n] = node.activation
             max_a = max(activation.values()) if activation else 1.0
             if max_a > 0:
                 return {n: a / max_a for n, a in activation.items()}
