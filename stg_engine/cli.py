@@ -126,7 +126,9 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional, List, Tuple
+
+from stg_engine.engine import PROVENANCE_FIELDS
 
 # --- Settings ---
 _CLI_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -415,16 +417,37 @@ def cmd_grep(engine, pattern, limit=20, full=False):
 
 
 def cmd_query(engine, pattern, limit=20):
-    nodes = engine.query_nodes(name_pattern=pattern, limit=limit)
+    """Fuzzy node search with optional namespace scoping.
+
+    Pattern grammar:
+        <text>           — substring match across all node names (any namespace)
+        <ns>:            — list every node in `<ns>` namespace (no name filter)
+        <ns>:<text>      — substring match on name, scoped to `<ns>` namespace
+    """
+    # Parse `Namespace:NamePattern` form when a colon is present
+    if ":" in pattern:
+        ns_part, _, name_part = pattern.partition(":")
+        namespace = ns_part if ns_part else None
+        name_pattern = name_part if name_part else None
+    else:
+        namespace = None
+        name_pattern = pattern
+
+    nodes = engine.query_nodes(
+        name_pattern=name_pattern, namespace=namespace, limit=limit,
+    )
     if not nodes:
         print(f"No nodes matching '{pattern}'")
         return
-    total = len(engine.query_nodes(name_pattern=pattern, limit=10000))
+    total = len(engine.query_nodes(
+        name_pattern=name_pattern, namespace=namespace, limit=10000,
+    ))
     shown = len(nodes)
     suffix = f" (showing {shown}/{total})" if total > shown else ""
     print(f"Nodes matching '{pattern}'{suffix}:")
     for n in nodes:
-        parts = [f"  {n.name}"]
+        display = f"{n.namespace}:{n.name}" if n.namespace else n.name
+        parts = [f"  {display}"]
         if n.tension > 0:
             parts.append(f"T={n.tension:.3f}")
         if n.activation > 0:
@@ -434,37 +457,76 @@ def cmd_query(engine, pattern, limit=20):
             parts.append(f"[{comm}]")
         print(" | ".join(parts))
 
-    # Also show related edges
-    edges = engine.query_edges(limit=200)
-    related = [e for e in edges if pattern.lower() in e.source.lower() or pattern.lower() in e.target.lower()]
-    if related:
-        print(f"\nRelated edges ({len(related)}):")
-        for e in related[:10]:
-            is_virtual = e.modifiers.get("edge_class") == "virtual"
-            arrow = " ~ " if is_virtual else " -> "
-            mod = f"confidence={e.confidence}"
-            if e.rule:
-                mod += f', rule="{e.rule}"'
-            if is_virtual:
-                reason = e.modifiers.get("virtual_reason", "")
-                mod += f', virtual={reason}'
-            print(f"  [{e.source}]{arrow}[{e.target}] ::mod({mod})")
-            for line in _format_edge_modifiers(e, indent="    "):
-                print(line)
+    # Helper: namespace-prefixed display name for edge endpoints
+    def _ns_label(name: str) -> str:
+        node = engine._nodes.get(name.lower().replace("-", "_"))
+        if node and node.namespace:
+            return f"{node.namespace}:{name}"
+        return name
+
+    # Related edges: filter by name part (skip when listing a whole namespace)
+    if name_pattern:
+        edges = engine.query_edges(limit=200)
+        np = name_pattern.lower()
+        related = [
+            e for e in edges
+            if np in e.source.lower() or np in e.target.lower()
+        ]
+        # If a namespace was given, also restrict to edges where at least one
+        # endpoint is in that namespace (otherwise `Game:Elden` would surface
+        # cross-namespace mentions of "Elden" too).
+        if namespace is not None:
+            ns_lower = namespace.lower()
+            def _in_ns(name: str) -> bool:
+                node = engine._nodes.get(name.lower().replace("-", "_"))
+                return bool(
+                    node and node.namespace is not None
+                    and node.namespace.lower() == ns_lower
+                )
+            related = [e for e in related if _in_ns(e.source) or _in_ns(e.target)]
+        if related:
+            print(f"\nRelated edges ({len(related)}):")
+            for e in related[:10]:
+                is_virtual = e.modifiers.get("edge_class") == "virtual"
+                arrow = " ~ " if is_virtual else " -> "
+                mod = f"confidence={e.confidence}"
+                if e.rule:
+                    mod += f', rule="{e.rule}"'
+                if is_virtual:
+                    reason = e.modifiers.get("virtual_reason", "")
+                    mod += f', virtual={reason}'
+                print(f"  [{_ns_label(e.source)}]{arrow}[{_ns_label(e.target)}] ::mod({mod})")
+                mod_lines, _ = _format_edge_modifiers(e, indent="    ")
+                for line in mod_lines:
+                    print(line)
 
 
-def cmd_dump(engine, page_size=100, start=0):
+def cmd_dump(engine, page_size=100, start=0, namespace=None):
     """Paginated dump of all nodes and their related edges.
 
     Sorted by node name. Each page shows `page_size` nodes; after each page the
     user is prompted to continue (ENTER), jump to a node (number), or quit (q).
+
+    Args:
+        namespace: If set, only nodes whose `namespace` field matches this
+            string are dumped. Edges referencing such nodes still display
+            their endpoints with full namespace prefixes.
     """
     all_nodes = sorted(engine._nodes.values(), key=lambda n: n.name.lower())
+    if namespace is not None:
+        ns_lower = namespace.lower()
+        all_nodes = [
+            n for n in all_nodes
+            if n.namespace is not None and n.namespace.lower() == ns_lower
+        ]
     total_nodes = len(all_nodes)
     total_edges = len(engine._edges)
 
     if total_nodes == 0:
-        print("Graph is empty.")
+        if namespace is not None:
+            print(f"No nodes in namespace '{namespace}'.")
+        else:
+            print("Graph is empty.")
         return
 
     # Build node -> edges index (both directions) for O(1) lookup per node.
@@ -476,7 +538,16 @@ def cmd_dump(engine, page_size=100, start=0):
         if e.target.lower() != e.source.lower():
             edge_index.setdefault(e.target.lower(), []).append(("in", e))
 
-    print(f"Dumping {total_nodes} nodes / {total_edges} edges (page size {page_size})")
+    # Helper: format a name with its namespace prefix when available.
+    # Node name lookup mirrors engine._nk normalization (lower + hyphen→_).
+    def _ns_label(name: str) -> str:
+        node = engine._nodes.get(name.lower().replace("-", "_"))
+        if node and node.namespace:
+            return f"{node.namespace}:{name}"
+        return name
+
+    scope_msg = f" in namespace '{namespace}'" if namespace else ""
+    print(f"Dumping {total_nodes} nodes{scope_msg} / {total_edges} edges (page size {page_size})")
     print()
 
     idx = max(0, start)
@@ -485,7 +556,8 @@ def cmd_dump(engine, page_size=100, start=0):
         print(f"=== Nodes {idx + 1}-{end} / {total_nodes} ===")
         for i in range(idx, end):
             n = all_nodes[i]
-            parts = [f"[{i + 1}] {n.name}"]
+            display = f"{n.namespace}:{n.name}" if n.namespace else n.name
+            parts = [f"[{i + 1}] {display}"]
             if n.tension > 0:
                 parts.append(f"T={n.tension:.3f}")
             if n.activation > 0:
@@ -509,7 +581,9 @@ def cmd_dump(engine, page_size=100, start=0):
                     reason = e.modifiers.get("virtual_reason", "")
                     mod += f", virtual={reason}"
                 tag = "  out" if direction == "out" else "  in "
-                print(f"  {tag} [{e.source}]{arrow}[{e.target}] ::mod({mod})")
+                src_label = _ns_label(e.source)
+                tgt_label = _ns_label(e.target)
+                print(f"  {tag} [{src_label}]{arrow}[{tgt_label}] ::mod({mod})")
                 desc = e.modifiers.get("description") or e.modifiers.get("lesson")
                 if desc:
                     if len(desc) > 120:
@@ -1493,16 +1567,26 @@ def cmd_paths(engine, source, target):
     print(f"Path tension: {tension:.4f}")
 
 
-def _format_edge_modifiers(e, indent="      "):
-    """Format edge modifiers for display. Returns list of lines (empty if no modifiers)."""
-    lines = []
+def _format_edge_modifiers(e, indent="      ", show_provenance=False):
+    """Format edge modifiers for display.
+
+    Returns (lines, hidden_count). Provenance/audit fields (PROVENANCE_FIELDS in
+    stg_engine.engine — source, created_at, superseded_at, ...) are folded by
+    default; pass show_provenance=True to expand them. The hidden_count lets
+    callers print a summary footer.
+    """
+    lines: List[str] = []
+    hidden = 0
     if not e.modifiers:
-        return lines
+        return lines, hidden
     for k, v in e.modifiers.items():
         if k == "edge_class":
             continue  # already shown elsewhere
+        if not show_provenance and k in PROVENANCE_FIELDS:
+            hidden += 1
+            continue
         lines.append(f"{indent}{k}: {v}")
-    return lines
+    return lines, hidden
 
 
 def _resolve_node_name(engine, name):
@@ -1554,7 +1638,40 @@ def _is_virtual_edge(e):
     return "virtual_reason" in mods
 
 
-def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None):
+# Display thresholds for edge attributes — only render when the value carries
+# discriminative signal. Defaults are silent.
+_CONFIDENCE_DISPLAY_THRESHOLD = 0.5    # show c= only when "probable but uncertain" or worse
+_STRENGTH_DEFAULT = 0.5                # show s= only when deviating from default
+_SALIENCE_DEVIATION_TOLERANCE = 0.15   # show sal= only when Hebbian has moved it
+                                       # significantly (3+ strengthen steps at default rate)
+
+
+def _format_edge_attrs(edge) -> str:
+    """Render the inline attribute parenthetical for an edge.
+
+    Hides default/expected values; shows only outliers that carry signal:
+    - confidence: only when < 0.5  (true low-confidence outlier — flag visually)
+    - strength:   only when != 0.5 (non-default; matches STL export logic)
+    - salience:   only when |sal - conf| > 0.15 (significantly Hebbian-modified;
+                  ignores background micro-adjustments from a few activations)
+    - rule:       only when present
+
+    Returns empty string when no attributes deserve display, leading to a
+    clean `→ [Target]` line for the common case.
+    """
+    parts = []
+    if edge.confidence < _CONFIDENCE_DISPLAY_THRESHOLD:
+        parts.append(f"c={edge.confidence}")
+    if abs(edge.strength - _STRENGTH_DEFAULT) > 0.001:
+        parts.append(f"s={edge.strength}")
+    if abs(edge.salience - edge.confidence) > _SALIENCE_DEVIATION_TOLERANCE:
+        parts.append(f"sal={edge.salience:.2f}")
+    if edge.rule:
+        parts.append(f'rule="{edge.rule}"')
+    return f" ({', '.join(parts)})" if parts else ""
+
+
+def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None, show_provenance=False):
     """Print full node detail with configurable indent.
 
     Extracted from cmd_node so community-mode propagate can inline
@@ -1563,6 +1680,9 @@ def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None)
     Virtual edges are filtered by default (show_virtual=False) — they are
     auto-generated structural bridges with no real description, and clutter
     the output. Count of hidden virtual edges is still reported.
+
+    Provenance fields (source/created_at/...) are folded by default to keep the
+    semantic core readable; pass show_provenance=True (cli: --full) to expand.
 
     If `limit` is set, only the first N edges in each direction are rendered
     (useful for high-degree nodes like `Jesus` with 470+ real edges).
@@ -1579,11 +1699,28 @@ def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None)
     print(f"{pfx}  Tension: {node.tension:.4f}")
     print(f"{pfx}  Activation: {node.activation:.4f}")
     print(f"{pfx}  Self-Relevance: {node.self_relevance:.4f}")
+
+    # STL Protocol §9.4: node attributes (materialized from intrinsic-property
+    # self-loops, or written by other ingest paths like markdown_extractor)
+    # are summarized here with a count; `stg attrs <name>` lists them in full.
+    # Default minimalism — node detail focuses on graph topology, attributes
+    # are queried explicitly when needed.
     if node.metadata:
-        print(f"{pfx}  Metadata: {node.metadata}")
+        n_keys = len(node.metadata)
+        plural = "key" if n_keys == 1 else "keys"
+        agent_flag = (
+            f"--agent {SETTINGS['agent']} "
+            if SETTINGS.get("agent", _DEFAULT_AGENT) != _DEFAULT_AGENT
+            else ""
+        )
+        print(
+            f"{pfx}  Properties: {n_keys} {plural} "
+            f"(use 'stg {agent_flag}attrs \"{node.name}\"' to view)"
+        )
 
     out_edges_all = engine.get_edges(source=name)
     in_edges_all = engine.get_edges(target=name)
+
     if show_virtual:
         out_edges, in_edges = out_edges_all, in_edges_all
         out_virtual = in_virtual = 0
@@ -1597,16 +1734,19 @@ def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None)
     in_shown = in_edges if limit is None else in_edges[:limit]
     out_truncated = len(out_edges) - len(out_shown)
     in_truncated = len(in_edges) - len(in_shown)
+    total_provenance_hidden = 0
     if out_edges:
         header = f"\n{pfx}  Outgoing ({len(out_edges)})"
         if limit is not None and len(out_edges) > limit:
             header += f" [showing {limit}]"
         print(f"{header}:")
         for e in out_shown:
-            rule_str = f', rule="{e.rule}"' if e.rule else ""
-            sal_str = f", sal={e.salience:.2f}" if abs(e.salience - e.confidence) > 0.01 else ""
-            print(f"{pfx}    → [{e.target}] (c={e.confidence}, s={e.strength}{sal_str}{rule_str})")
-            for line in _format_edge_modifiers(e, indent=mod_indent):
+            print(f"{pfx}    → [{e.target}]{_format_edge_attrs(e)}")
+            mod_lines, hidden = _format_edge_modifiers(
+                e, indent=mod_indent, show_provenance=show_provenance
+            )
+            total_provenance_hidden += hidden
+            for line in mod_lines:
                 print(line)
         if out_truncated:
             print(f"{pfx}    (+ {out_truncated} more outgoing edge(s) truncated, raise --limit to show)")
@@ -1618,19 +1758,195 @@ def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None)
             header += f" [showing {limit}]"
         print(f"{header}:")
         for e in in_shown:
-            rule_str = f', rule="{e.rule}"' if e.rule else ""
-            sal_str = f", sal={e.salience:.2f}" if abs(e.salience - e.confidence) > 0.01 else ""
-            print(f"{pfx}    ← [{e.source}] (c={e.confidence}, s={e.strength}{sal_str}{rule_str})")
-            for line in _format_edge_modifiers(e, indent=mod_indent):
+            print(f"{pfx}    ← [{e.source}]{_format_edge_attrs(e)}")
+            mod_lines, hidden = _format_edge_modifiers(
+                e, indent=mod_indent, show_provenance=show_provenance
+            )
+            total_provenance_hidden += hidden
+            for line in mod_lines:
                 print(line)
         if in_truncated:
             print(f"{pfx}    (+ {in_truncated} more incoming edge(s) truncated, raise --limit to show)")
     if in_virtual:
         print(f"{pfx}    (+ {in_virtual} virtual edge(s) hidden, use --virtual to show)")
+    if total_provenance_hidden and not show_provenance:
+        plural = "field" if total_provenance_hidden == 1 else "fields"
+        print(
+            f"{pfx}    (+ {total_provenance_hidden} provenance {plural} hidden "
+            f"[source/created_at/...], use --full to show)"
+        )
 
 
-def cmd_node(engine, name, show_virtual=False, limit=None):
-    _render_node_detail(engine, name, indent="", show_virtual=show_virtual, limit=limit)
+def cmd_node(engine, name, show_virtual=False, limit=None, show_provenance=False):
+    _render_node_detail(
+        engine, name, indent="",
+        show_virtual=show_virtual, limit=limit, show_provenance=show_provenance,
+    )
+
+
+def cmd_attrs(engine, args):
+    r"""Query node attributes (materialized from intrinsic-property self-loops
+    or other ingest paths that write to node.metadata).
+
+    Usage:
+        stg attrs <node>                       # single node detail
+        stg attrs --namespace <ns>             # all nodes in namespace
+        stg attrs --field key=value [...]      # field filter (multiple, AND)
+        stg attrs --where "<sql>"              # SQL where on metadata_json
+        stg attrs --keys                       # discover available metadata keys
+        stg attrs --limit N                    # truncate output
+
+    Combinable:
+        --namespace stacks with --field, --where, or --keys.
+        --keys with a node argument lists that node's keys.
+
+    Examples:
+        stg attrs Elden_Ring
+        stg attrs --namespace Game
+        stg attrs --namespace Game --field release_year=2022
+        stg attrs --where "JSON_EXTRACT(metadata_json,'$.release_year')>'2020'"
+        stg attrs --keys                          # all keys in graph
+        stg attrs --namespace Game --keys         # keys + coverage in namespace
+        stg attrs Elden_Ring --keys               # just the keys, no values
+    """
+    namespace = None
+    field_filters: Dict[str, str] = {}
+    where_clause = None
+    limit = None
+    target = None
+    keys_only = False
+
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--namespace" and i + 1 < len(args):
+            namespace = args[i + 1]
+            i += 2
+        elif a == "--field" and i + 1 < len(args):
+            f = args[i + 1]
+            if "=" not in f:
+                print(f"Invalid --field: '{f}' (expected key=value)")
+                return
+            k, v = f.split("=", 1)
+            field_filters[k] = v
+            i += 2
+        elif a == "--where" and i + 1 < len(args):
+            where_clause = args[i + 1]
+            i += 2
+        elif a == "--keys":
+            keys_only = True
+            i += 1
+        elif a == "--limit" and i + 1 < len(args):
+            try:
+                limit = int(args[i + 1])
+            except ValueError:
+                print(f"Invalid --limit: {args[i + 1]}")
+                return
+            i += 2
+        elif a.startswith("--"):
+            print(f"Unknown flag: {a}")
+            return
+        else:
+            target = a
+            i += 1
+
+    # ─── --keys discovery mode ─────────────────────────────────────────
+    if keys_only:
+        if target:
+            # Node-level: list this node's keys (no values, no coverage)
+            items = engine.query_metadata_keys(node_name=target)
+            if not items:
+                print(f"Node '{target}' has no metadata keys.")
+                return
+            print(f"Node: {target}")
+            for k, _, _ in items:
+                print(f"  {k}")
+            return
+        # Scope-level: namespace or whole graph, with coverage table
+        items = engine.query_metadata_keys(namespace=namespace)
+        if not items:
+            scope_desc = f"namespace '{namespace}'" if namespace else "graph"
+            print(f"No metadata keys found in {scope_desc}.")
+            return
+        total = items[0][2]
+        FIELD_W = max((len(k) for k, _, _ in items), default=5)
+        FIELD_W = max(FIELD_W, len("Field"))
+        print(f"{'Field':<{FIELD_W}} | Coverage")
+        print("─" * (FIELD_W + 14))
+        for k, count, _ in items:
+            pct = round(100 * count / total)
+            print(f"{k:<{FIELD_W}} | {count}/{total} ({pct}%)")
+        scope_desc = f" in namespace '{namespace}'" if namespace else ""
+        print(f"\n({len(items)} unique keys across {total} nodes{scope_desc})")
+        return
+
+    # ─── Single-node mode ──────────────────────────────────────────────
+    if target and not (namespace or field_filters or where_clause):
+        _, node = _resolve_node_name(engine, target)
+        if not node:
+            print(f"Node not found: {target}")
+            return
+        print(f"Node: {node.name}")
+        if node.namespace:
+            print(f"  Namespace: {node.namespace}")
+        if not node.metadata:
+            print("  (no attributes)")
+            return
+        for k, v in node.metadata.items():
+            print(f"  {k}: {v}")
+        return
+
+    # ─── List mode ─────────────────────────────────────────────────────
+    if where_clause:
+        try:
+            results = engine.query_node_attrs_sql(
+                where_clause, db_path=STG_PATH, namespace=namespace,
+            )
+        except ValueError as e:
+            print(f"Error: {e}")
+            return
+        # Apply --field filters in-memory after the SQL where (AND composition)
+        if field_filters:
+            results = [
+                n for n in results
+                if all(str(n.metadata.get(k)) == str(v)
+                       for k, v in field_filters.items())
+            ]
+    else:
+        results = engine.query_node_attrs(
+            namespace=namespace,
+            field_filters=field_filters or None,
+        )
+
+    if not results:
+        print("No matching nodes.")
+        return
+
+    # Collect union of attribute keys for table columns
+    all_keys: set = set()
+    for n in results:
+        all_keys.update(n.metadata.keys())
+    keys = sorted(all_keys)
+
+    truncated = limit is not None and len(results) > limit
+    if limit:
+        results = results[:limit]
+
+    # Render table
+    NAME_W = 30
+    KEY_W = 16
+    header = f"{'Node':<{NAME_W}} | " + " | ".join(f"{k:<{KEY_W}}" for k in keys)
+    print(header)
+    print("─" * len(header))
+    for n in results:
+        row = " | ".join(
+            f"{str(n.metadata.get(k, ''))[:KEY_W]:<{KEY_W}}"
+            for k in keys
+        )
+        print(f"{n.name[:NAME_W]:<{NAME_W}} | {row}")
+
+    suffix = f" (truncated to {limit})" if truncated else ""
+    print(f"\n({len(results)} node(s){suffix})")
 
 
 def _save_last_ingest(new_nodes, candidates):
@@ -4147,6 +4463,7 @@ def main():
         args = sys.argv[2:]
         page_size = 100
         start = 0
+        namespace = None
         if "--page" in args:
             idx = args.index("--page")
             if idx + 1 < len(args):
@@ -4161,7 +4478,11 @@ def main():
                     start = int(args[idx + 1]) - 1
                 except ValueError:
                     pass
-        cmd_dump(engine, page_size=page_size, start=start)
+        if "--namespace" in args:
+            idx = args.index("--namespace")
+            if idx + 1 < len(args):
+                namespace = args[idx + 1]
+        cmd_dump(engine, page_size=page_size, start=start, namespace=namespace)
     elif cmd == "query" and len(sys.argv) >= 3:
         # Parse --limit N flag
         args = sys.argv[2:]
@@ -4293,7 +4614,8 @@ def main():
     elif cmd == "node" and len(sys.argv) >= 3:
         node_args = sys.argv[2:]
         show_virtual = "--virtual" in node_args
-        node_args = [a for a in node_args if a != "--virtual"]
+        show_provenance = "--full" in node_args
+        node_args = [a for a in node_args if a not in ("--virtual", "--full")]
         limit = None
         if "--limit" in node_args:
             idx = node_args.index("--limit")
@@ -4304,7 +4626,11 @@ def main():
                     pass
                 node_args = node_args[:idx] + node_args[idx + 2:]
         if node_args:
-            cmd_node(engine, node_args[0], show_virtual=show_virtual, limit=limit)
+            cmd_node(
+                engine, node_args[0],
+                show_virtual=show_virtual, limit=limit,
+                show_provenance=show_provenance,
+            )
     elif cmd == "ingest" and len(sys.argv) >= 3:
         args = sys.argv[2:]
         cognitive = "--cognitive" in args
@@ -4342,6 +4668,8 @@ def main():
         subcmd = sys.argv[2] if len(sys.argv) >= 3 else ""
         args = sys.argv[3:] if len(sys.argv) >= 4 else []
         cmd_alias(engine, subcmd, args)
+    elif cmd == "attrs":
+        cmd_attrs(engine, sys.argv[2:])
     elif cmd == "metrics":
         cmd_metrics(engine)
     elif cmd == "importance":

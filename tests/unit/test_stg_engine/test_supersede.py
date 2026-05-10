@@ -48,17 +48,20 @@ class TestSupersedeDetection:
 
     def test_flags_same_source_field_value_different_target(self):
         e = self._engine()
-        e.add_edge("王婆", "李逍遥", confidence=0.9, rule="empirical",
-                    relation="师傅", description="old teacher")
-        e.add_edge("王婆", "张三丰", confidence=0.9, rule="empirical",
-                    relation="师傅", description="new teacher")
+        # Single-value field (status) + >60s gap → genuine correction
+        e.add_edge("Project_X", "Active", confidence=0.9, rule="empirical",
+                    status="phase", description="old phase",
+                    created_at=1000.0)
+        e.add_edge("Project_X", "Done", confidence=0.9, rule="empirical",
+                    status="phase", description="new phase",
+                    created_at=2000.0)
 
         old = [x for x in e._edges
-               if x.target.lower() == "李逍遥"
-               and x.modifiers.get("relation") == "师傅"]
+               if x.target.lower() == "active"
+               and x.modifiers.get("status") == "phase"]
         assert len(old) == 1
         assert old[0].modifiers.get("suspected_supersede") is True
-        assert old[0].modifiers.get("superseded_by") == "张三丰"
+        assert old[0].modifiers.get("superseded_by") == "Done"
 
     def test_different_field_no_flag(self):
         e = self._engine()
@@ -102,19 +105,22 @@ class TestSupersedeDetection:
         assert not any(x.modifiers.get("suspected_supersede") for x in virtual)
 
     def test_chain_correction_re_flags(self):
-        """A→B then A→C then A→D: both B and C should be flagged by D."""
+        """A→B then A→C then A→D: both B and C should be flagged by D.
+
+        Uses single-value field + spaced timestamps so both guards pass.
+        """
         e = self._engine()
-        e.add_edge("NPC", "B", confidence=0.9, relation="师傅",
-                    description="first")
-        e.add_edge("NPC", "C", confidence=0.9, relation="师傅",
-                    description="second")
-        e.add_edge("NPC", "D", confidence=0.9, relation="师傅",
-                    description="third")
+        e.add_edge("NPC", "B", confidence=0.9, status="phase",
+                    description="first", created_at=1000.0)
+        e.add_edge("NPC", "C", confidence=0.9, status="phase",
+                    description="second", created_at=2000.0)
+        e.add_edge("NPC", "D", confidence=0.9, status="phase",
+                    description="third", created_at=3000.0)
 
         for name in ("b", "c"):
             flagged = [x for x in e._edges
                        if x.target.lower() == name
-                       and x.modifiers.get("relation") == "师傅"]
+                       and x.modifiers.get("status") == "phase"]
             assert len(flagged) == 1
             assert flagged[0].modifiers.get("suspected_supersede") is True
             assert flagged[0].modifiers.get("superseded_by") == "D"
@@ -127,14 +133,46 @@ class TestSupersedeDetection:
         all_edges = list(e._edges)
         assert not any(x.modifiers.get("suspected_supersede") for x in all_edges)
 
+    def test_multi_value_field_no_flag(self):
+        """Guard A: is_a / action / role are cardinality=many — must not flag.
+
+        Regression for stg-steam: every Game→Feature edge was being
+        falsely marked superseded by whatever feature was ingested last.
+        """
+        e = self._engine()
+        e.add_edge("Game", "Single_player", confidence=0.99, is_a="game_feature",
+                    created_at=1000.0)
+        e.add_edge("Game", "Multi_player", confidence=0.99, is_a="game_feature",
+                    created_at=2000.0)
+        e.add_edge("Game", "PvP", confidence=0.99, is_a="game_feature",
+                    created_at=3000.0)
+
+        all_edges = [x for x in e._edges
+                     if x.modifiers.get("is_a") == "game_feature"]
+        assert len(all_edges) == 3
+        assert not any(x.modifiers.get("suspected_supersede") for x in all_edges)
+
+    def test_same_batch_no_flag(self):
+        """Guard B: edges within SUPERSEDE_MIN_GAP_SECONDS = co-declared, not correction."""
+        e = self._engine()
+        # Same single-value field, but ingested 1 second apart (within 60s window)
+        e.add_edge("Project_Y", "Active", confidence=0.9, status="phase",
+                    created_at=1000.0)
+        e.add_edge("Project_Y", "Pending", confidence=0.9, status="phase",
+                    created_at=1001.0)
+
+        edges = [x for x in e._edges if x.modifiers.get("status") == "phase"]
+        assert len(edges) == 2
+        assert not any(x.modifiers.get("suspected_supersede") for x in edges)
+
     def test_superseded_at_set(self):
         e = self._engine()
-        e.add_edge("王婆", "李逍遥", confidence=0.9, relation="师傅",
-                    description="old")
-        e.add_edge("王婆", "张三丰", confidence=0.9, relation="师傅",
+        e.add_edge("Project_X", "Active", confidence=0.9, status="phase",
+                    description="old", created_at=500.0)
+        e.add_edge("Project_X", "Done", confidence=0.9, status="phase",
                     description="new", created_at=1000.0)
 
         old = [x for x in e._edges
-               if x.target.lower() == "李逍遥"
-               and x.modifiers.get("relation") == "师傅"]
+               if x.target.lower() == "active"
+               and x.modifiers.get("status") == "phase"]
         assert old[0].modifiers.get("superseded_at") == 1000.0

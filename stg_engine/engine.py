@@ -8,6 +8,7 @@ Formulas execute directly on the graph. Persistence is serialization.
 """
 
 import logging
+import os
 import re
 import time as _time
 from typing import Dict, FrozenSet, List, Optional, Any, Tuple
@@ -17,6 +18,8 @@ logger = logging.getLogger(__name__)
 # Universal semantic-carrying modifier fields.
 # Used by supersede detection: when two edges share (source, field, value)
 # but differ in target, the older one is flagged as suspected_supersede.
+# Note: only fields in SUPERSEDE_SINGLE_VALUE_FIELDS actually trigger supersede
+# flagging — other fields (is_a/action/role/...) are cardinality=many by nature.
 SEMANTIC_FIELDS: Tuple[str, ...] = (
     "relation",
     "status",
@@ -28,6 +31,32 @@ SEMANTIC_FIELDS: Tuple[str, ...] = (
     "predicate",
     "phase",
 )
+
+# Subset of SEMANTIC_FIELDS where (src, field, value) repeating with different
+# targets really does mean "user changed their mind" (single-valued at any time).
+# Other fields like is_a / action / role are cardinality=many — same triple with
+# different targets is the normal pattern (e.g. one game has many features).
+SUPERSEDE_SINGLE_VALUE_FIELDS: frozenset = frozenset({"status", "phase"})
+
+# Provenance / audit metadata — describes *where this edge came from* rather
+# than what it semantically asserts. Tends to repeat verbatim across batch-
+# ingested edges (e.g. all 36 Elden_Ring edges sharing source="steam_appdetails")
+# and crowds out the semantic core in node views. The cli folds these by
+# default; pass --full to expand. Non-exhaustive — add new audit fields here as
+# they appear. Note: occurred_time and author are intentionally NOT folded —
+# they often carry semantic content (event dates, attribution).
+PROVENANCE_FIELDS: frozenset = frozenset({
+    "source",
+    "created_at",
+    "recorded_at",
+    "superseded_at",
+    "batch_id",
+    "ingested_at",
+})
+
+# Two edges created within this window are treated as a co-declared batch, not
+# a "user updated their mind" pattern. Avoids spam-flagging during bulk ingest.
+SUPERSEDE_MIN_GAP_SECONDS: float = 60.0
 
 
 def _get_semantic_field(modifiers: Optional[dict]) -> Tuple[Optional[str], Optional[str]]:
@@ -582,10 +611,19 @@ class STGEngine:
         Heuristic: same source, same (semantic_field, semantic_value) pair
         but DIFFERENT target. The older edge is flagged, not deleted.
 
+        Two guards prevent over-flagging on cardinality=many relations:
+        (A) Only single-value fields (status / phase) trigger the check —
+            is_a / action / role / etc. are multi-value by nature.
+        (B) Edges created within SUPERSEDE_MIN_GAP_SECONDS of each other are
+            treated as co-declared batch, not correction.
+
         Returns the number of edges flagged.
         """
         new_field, new_value = _get_semantic_field(new_edge.modifiers)
         if not new_field or not new_value:
+            return 0
+        # Guard A: skip multi-value fields entirely
+        if new_field not in SUPERSEDE_SINGLE_VALUE_FIELDS:
             return 0
 
         nk = self._nk
@@ -609,6 +647,11 @@ class STGEngine:
             if other_field != new_field:
                 continue
             if str(other_value) != str(new_value):
+                continue
+            # Guard B: same-batch co-declaration, not a correction
+            other_ts = float(getattr(other, "created_at", 0.0) or 0.0)
+            if new_ts > 0.0 and other_ts > 0.0 and \
+                    abs(new_ts - other_ts) < SUPERSEDE_MIN_GAP_SECONDS:
                 continue
             other.modifiers["suspected_supersede"] = True
             other.modifiers["superseded_by"] = str(new_edge.target)
@@ -668,6 +711,156 @@ class STGEngine:
         elif tgt is not None:
             return [e for e in self._edges if _nk(e.target) == tgt]
         return list(self._edges)
+
+    def query_node_attrs(
+        self,
+        namespace: Optional[str] = None,
+        field_filters: Optional[Dict[str, str]] = None,
+    ) -> List[STGNode]:
+        """Filter nodes by namespace and/or metadata field values.
+
+        All comparisons are string-based (metadata values are stored as strings
+        in the JSON blob). Filters compose with AND. With no filters, returns
+        all nodes that have non-empty metadata.
+
+        Args:
+            namespace: If set, keep only nodes with matching namespace.
+            field_filters: If set, keep only nodes whose metadata[k] == str(v)
+                for every (k, v).
+
+        Returns:
+            List of STGNode, sorted by name (case-insensitive).
+        """
+        results: List[STGNode] = []
+        has_any_filter = bool(namespace or field_filters)
+        ns_lower = namespace.lower() if namespace is not None else None
+        for node in self._nodes.values():
+            if ns_lower is not None and (
+                node.namespace is None or node.namespace.lower() != ns_lower
+            ):
+                continue
+            if field_filters:
+                ok = all(
+                    str(node.metadata.get(k)) == str(v)
+                    for k, v in field_filters.items()
+                )
+                if not ok:
+                    continue
+            # If user specified no filters, only include nodes that actually
+            # have attributes (skip empty-metadata nodes that would clutter).
+            if not has_any_filter and not node.metadata:
+                continue
+            results.append(node)
+        results.sort(key=lambda n: n.name.lower())
+        return results
+
+    def query_metadata_keys(
+        self,
+        namespace: Optional[str] = None,
+        node_name: Optional[str] = None,
+    ) -> List[Tuple[str, int, int]]:
+        """Discover the metadata key universe — what attributes exist?
+
+        Schema-less JSON metadata makes ad-hoc key discovery essential: unlike
+        a relational table where columns are fixed, two nodes in the same
+        namespace may carry different field sets. This method enumerates the
+        keys actually present and reports per-key coverage.
+
+        Args:
+            node_name: If set, scope is just that single node.
+            namespace: If set (and node_name is None), scope is all nodes in
+                that namespace with non-empty metadata.
+            (both None): Scope is all nodes in the graph with non-empty metadata.
+
+        Returns:
+            List of (key, count, total), where:
+            - count = number of in-scope nodes that have this key
+            - total = total number of in-scope nodes
+            Sorted by count descending, then key ascending. Empty list when
+            scope is empty or no metadata present.
+        """
+        if node_name is not None:
+            node = self.get_node(node_name)
+            if node is None or not node.metadata:
+                return []
+            return [(k, 1, 1) for k in sorted(node.metadata.keys())]
+
+        if namespace is not None:
+            ns_lower = namespace.lower()
+            scope = [
+                n for n in self._nodes.values()
+                if n.namespace is not None
+                and n.namespace.lower() == ns_lower
+                and n.metadata
+            ]
+        else:
+            scope = [n for n in self._nodes.values() if n.metadata]
+
+        total = len(scope)
+        if total == 0:
+            return []
+
+        counts: Dict[str, int] = {}
+        for n in scope:
+            for k in n.metadata.keys():
+                counts[k] = counts.get(k, 0) + 1
+
+        items = [(k, c, total) for k, c in counts.items()]
+        items.sort(key=lambda kct: (-kct[1], kct[0]))
+        return items
+
+    def query_node_attrs_sql(
+        self,
+        where_clause: str,
+        db_path: str,
+        namespace: Optional[str] = None,
+    ) -> List[STGNode]:
+        """Run a user-supplied SQL where-clause against nodes.metadata_json.
+
+        The clause is interpreted in SQL with metadata fields accessed via
+        `JSON_EXTRACT(metadata_json, '$.<key>')`. Example:
+            "JSON_EXTRACT(metadata_json, '$.release_year') > '2020'"
+
+        Single-user tool — no SQL injection sanitization beyond rejecting `;`
+        (multi-statement). Reads the .stg file on disk; the engine's in-memory
+        state must be saved before calling. Resulting node names are mapped
+        back to in-memory STGNode objects.
+
+        Args:
+            where_clause: SQL WHERE expression (no leading "WHERE").
+            db_path: Path to the .stg SQLite file.
+            namespace: Optional additional namespace filter (parameterized).
+
+        Returns:
+            List of STGNode (intersection of SQL results and in-memory nodes).
+
+        Raises:
+            ValueError: If db_path does not exist or where_clause contains ';'.
+        """
+        import sqlite3
+
+        if ";" in where_clause:
+            raise ValueError("';' not allowed in --where clause")
+        if not os.path.exists(db_path):
+            raise ValueError(f"SQLite file not found: {db_path}")
+
+        sql = f"SELECT name FROM nodes WHERE {where_clause}"
+        params: tuple = ()
+        if namespace is not None:
+            sql += " AND LOWER(namespace) = LOWER(?)"
+            params = (namespace,)
+
+        conn = sqlite3.connect(db_path)
+        try:
+            cursor = conn.execute(sql, params)
+            names = [row[0] for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+        # Map back to in-memory nodes (by normalized key)
+        results = [self._nodes[self._nk(n)] for n in names if self._nk(n) in self._nodes]
+        results.sort(key=lambda n: n.name.lower())
+        return results
 
     def neighbors(self, name: str, direction: str = "out") -> List[str]:
         """Get neighbor node names (case-insensitive lookup).
@@ -735,6 +928,46 @@ class STGEngine:
     # STL Import
     # ═══════════════════════════════════════════════════════════
 
+    # Modifier keys that describe the intrinsic-properties edge "carrier"
+    # itself rather than user-facing node attributes — strip before merging
+    # into node.metadata.
+    _INTRINSIC_CARRIER_KEYS = frozenset({
+        "action",         # always "intrinsic_properties" — the trigger value
+        "edge_class",     # storage hint for edge class, n/a after materialization
+    })
+
+    def _try_materialize_intrinsic_properties(
+        self,
+        src_name: str,
+        src_ns: Optional[str],
+        tgt_name: str,
+        modifiers: Dict[str, Any],
+    ) -> bool:
+        """If this STL statement is a self-loop with action="intrinsic_properties",
+        materialize the modifiers into the source node's metadata and return True.
+
+        Returns False if the statement should proceed with normal edge ingest.
+
+        STL Operational Protocol §9.4: self-loops marked with
+        action="intrinsic_properties" are surface syntax for node-level
+        attributes. The graph edge is not created; modifiers are written to
+        nodes.metadata_json instead. confidence/strength/rule/time are edge-
+        level fields and have no meaning here, so they are discarded (already
+        popped from `modifiers` by the caller before this point).
+        """
+        if self._nk(src_name) != self._nk(tgt_name):
+            return False
+        if modifiers.get("action") != "intrinsic_properties":
+            return False
+
+        attrs = {
+            k: v for k, v in modifiers.items()
+            if k not in self._INTRINSIC_CARRIER_KEYS
+        }
+        # add_node merges into existing node.metadata when the node already exists
+        self.add_node(src_name, namespace=src_ns, **attrs)
+        return True
+
     def ingest_stl(
         self,
         stl_text: str,
@@ -781,6 +1014,7 @@ class STGEngine:
             strength = 0.5
             rule = None
             time_val = None
+            user_source = None
 
             if stmt.modifiers:
                 mod_dict = stmt.modifiers.model_dump(exclude_none=True)
@@ -792,8 +1026,9 @@ class STGEngine:
                 strength = modifiers.pop("strength", 0.5)
                 rule = modifiers.pop("rule", None)
                 time_val = modifiers.pop("time", None)
-                # Avoid collision with add_edge() positional params
-                modifiers.pop("source", None)
+                # Pop to avoid collision with add_edge() positional params,
+                # but preserve user-provided `source` (provenance per STL Protocol).
+                user_source = modifiers.pop("source", None)
                 modifiers.pop("target", None)
                 modifiers.pop("session_id", None)
                 modifiers.pop("event_id", None)
@@ -811,6 +1046,14 @@ class STGEngine:
                     except (ValueError, ImportError):
                         pass  # keep timestamp as modifier, don't set created_at
 
+            # STL Protocol §9.4: self-loop with action="intrinsic_properties"
+            # is surface syntax for node attributes. Materialize to
+            # node.metadata, do not create an edge.
+            if self._try_materialize_intrinsic_properties(
+                src_name, src_ns, tgt_name, modifiers,
+            ):
+                continue
+
             self.add_node(src_name, namespace=src_ns)
             self.add_node(tgt_name, namespace=tgt_ns)
 
@@ -825,6 +1068,8 @@ class STGEngine:
                 created_at=created_at,
                 **modifiers,
             )
+            if user_source is not None:
+                edge.modifiers["source"] = user_source
             new_edges.append(edge)
             count += 1
 
@@ -893,6 +1138,7 @@ class STGEngine:
             rule = None
             time_val = None
             edge_created_at = created_at
+            user_source = None
 
             mod_match = re.search(mod_pattern, line)
             if mod_match:
@@ -902,7 +1148,9 @@ class STGEngine:
                 strength = float(modifiers.pop("strength", 0.5))
                 rule = modifiers.pop("rule", None)
                 time_val = modifiers.pop("time", None)
-                modifiers.pop("source", None)
+                # Preserve user-provided `source` (provenance per STL Protocol);
+                # other names popped to avoid collision with add_edge() params.
+                user_source = modifiers.pop("source", None)
                 modifiers.pop("target", None)
                 modifiers.pop("session_id", None)
                 modifiers.pop("event_id", None)
@@ -921,6 +1169,12 @@ class STGEngine:
                     except (ValueError, ImportError):
                         pass
 
+            # STL Protocol §9.4: see ingest_stl for the rationale.
+            if self._try_materialize_intrinsic_properties(
+                src_name, src_ns, tgt_name, modifiers,
+            ):
+                continue
+
             self.add_node(src_name, namespace=src_ns)
             self.add_node(tgt_name, namespace=tgt_ns)
 
@@ -935,6 +1189,8 @@ class STGEngine:
                 created_at=edge_created_at,
                 **modifiers,
             )
+            if user_source is not None:
+                edge.modifiers["source"] = user_source
             new_edges.append(edge)
             count += 1
 
@@ -1491,6 +1747,10 @@ class STGEngine:
         # Build flat edges list for Rust
         _rust_edges: List[Tuple[str, str, float, float, bool]] = []
         for (src, tgt), edge in self._edges_lookup.items():
+            # STL Protocol §9.4: intrinsic-property self-loops are storage-only
+            # attribute carriers, not propagation paths.
+            if edge.is_intrinsic_property():
+                continue
             conf = edge.confidence
             sal = edge.salience
             is_virtual = edge.modifiers.get("edge_class") == "virtual"
@@ -1758,20 +2018,29 @@ class STGEngine:
         name_pattern: Optional[str] = None,
         anchor_type: Optional[str] = None,
         min_tension: Optional[float] = None,
+        namespace: Optional[str] = None,
         limit: int = 50,
     ) -> List[STGNode]:
         """Query nodes with filters.
 
         Args:
-            name_pattern: Substring match on node name (case-insensitive)
-            anchor_type: Filter by anchor type
-            min_tension: Minimum tension value
-            limit: Max results
+            name_pattern: Substring match on node name (case-insensitive).
+                Empty string matches all (use with `namespace` to list a whole
+                namespace).
+            anchor_type: Filter by anchor type.
+            min_tension: Minimum tension value.
+            namespace: Exact-match filter on node namespace.
+            limit: Max results.
 
         Returns:
-            Matching nodes
+            Matching nodes.
         """
         results = list(self._nodes.values())
+
+        if namespace is not None:
+            ns_lower = namespace.lower()
+            results = [n for n in results
+                       if n.namespace is not None and n.namespace.lower() == ns_lower]
 
         if name_pattern:
             pattern_lower = name_pattern.lower()

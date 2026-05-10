@@ -19,7 +19,7 @@ Usage:
     engine.save("memory.stg")
 """
 
-__version__ = "0.5.0a6"
+__version__ = "0.6.0a1"
 __author__ = "wuko / scos-lab"
 __license__ = "BUSL-1.1"
 __url__ = "https://github.com/scos-lab/stg-engine"
@@ -35,7 +35,7 @@ try:
 except ImportError:
     HAS_RUST_CORE = False
 
-from stg_engine.engine import STGEngine, SEMANTIC_FIELDS
+from stg_engine.engine import STGEngine, SEMANTIC_FIELDS, PROVENANCE_FIELDS
 from stg_engine.types import (
     STGNode, STGEdge, STGSession, STGEvent,
     STGTension, STGBeliefEvolution, SystemSnapshot,
@@ -113,6 +113,7 @@ __all__ = [
     "EPISTEMIC_KEYS",
     # Semantic fields + supersede detection
     "SEMANTIC_FIELDS",
+    "PROVENANCE_FIELDS",
     # Phase 11: Temporal Structure
     "query_time_range",
     "query_temporal_neighborhood",

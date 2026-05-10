@@ -9,6 +9,13 @@ from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, List, Tuple
 
 
+# Reserved value of the `action` meta semantic field marking a self-loop edge
+# as a node intrinsic property carrier. Defined by STL Operational Protocol §9.4:
+# such edges are storage-only attribute bags, excluded from propagation and
+# community detection but preserved in storage and retrievable as node Properties.
+INTRINSIC_PROPERTIES_ACTION = "intrinsic_properties"
+
+
 @dataclass
 class STGNode:
     """A semantic anchor in the computation graph.
@@ -105,6 +112,17 @@ class STGEdge:
     def uncertainty(self) -> float:
         """Uncertainty = 1 - confidence. Used in tension calculus."""
         return 1.0 - self.confidence
+
+    def is_intrinsic_property(self) -> bool:
+        """True if this is a self-loop edge carrying node intrinsic properties.
+
+        STL Operational Protocol §9.4: such edges are storage-only attribute
+        carriers, excluded from propagation and community detection.
+        """
+        if self.modifiers.get("action") != INTRINSIC_PROPERTIES_ACTION:
+            return False
+        # Self-loop check; mirror engine._nk normalization (lower + hyphen→underscore)
+        return self.source.lower().replace("-", "_") == self.target.lower().replace("-", "_")
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to dictionary."""

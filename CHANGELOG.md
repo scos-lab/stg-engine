@@ -4,6 +4,331 @@ All notable changes to STG Engine are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added — Namespace-aware `stg dump` and `stg query`
+
+Namespace is now a first-class browsing primitive across both inspection
+commands, complementing the attribute-focused `stg attrs --namespace`
+shipped in 0.6.0a1.
+
+`stg dump` (commit `82f59d4`):
+
+```
+[1] Game:Elden_Ring | [Game_Hub]
+    out [Game:Elden_Ring] -> [Tag:Souls_Like]
+    out [Game:Elden_Ring] -> [Studio:FromSoftware]
+```
+
+Every node line and every edge endpoint now renders with `Namespace:Name`
+prefix (matching STL syntax — copy-paste friendly). New `--namespace <ns>`
+flag scopes the listing.
+
+`stg query` (commit `5fdfc4f`) — pattern grammar extended:
+
+```
+stg query <text>          # whole-graph fuzzy on name (unchanged)
+stg query <ns>:           # list every node in <ns> namespace
+stg query <ns>:<text>     # fuzzy match on name, scoped to <ns>
+```
+
+Output uses the same `Namespace:Name` prefix in node listings and edge
+endpoints. When a namespace is given, the Related-edges section is
+filtered to edges that touch that namespace, suppressing cross-namespace
+mentions of the name.
+
+Why now: §9.4 v2 (intrinsic-properties materialize to node.metadata) and
+§10 plan Z (namespace = classification tag, not identity) both raise
+the importance of "browse by category" workflows — `stg query Game:`,
+`stg query Studio:`, `stg query Bug:` are now one-line entry points.
+
+Engine API: `STGEngine.query_nodes()` accepts a new `namespace` parameter
+(AND-composes with existing `name_pattern`, `anchor_type`, `min_tension`).
+
+### Fixed — Namespace comparisons are now case-insensitive
+
+User-reported regression: `stg query game:` returned no matches even
+though the agent had `Game`-namespace nodes. Cause was exact string
+equality in namespace filters. Aligned with the long-standing case
+treatment of node names (engine `_nk` normalizes to lower).
+
+All 6 namespace-comparison sites now match without case sensitivity
+(both Python paths and the SQL passthrough in `query_node_attrs_sql`,
+which uses `LOWER(namespace) = LOWER(?)`). Canonical casing from ingest
+is preserved in display.
+
+Affected commands: `stg query <ns>:`, `stg dump --namespace`,
+`stg attrs --namespace`. Commit `ab3bc68`.
+
+## [0.6.0a1] — 2026-05-10
+
+### Changed (BREAKING) — STL Protocol §9.4 v2: materialize intrinsic-property self-loops to node attributes
+
+`action="intrinsic_properties"` self-loops are now treated as **surface
+syntax** for node attributes. `ingest_stl` detects the self-loop pattern
+and writes the modifiers to `nodes.metadata_json`. **No graph edge is
+created** — `_edges`, `_edges_lookup`, `_graph`, and the SQLite `edges`
+table are untouched.
+
+The previous v1 contract (0.5.0a7, commit `0aaa350`) said "preserve edge
+data + filter at consumption sites." Engines kept the self-loop as a
+structural artifact and compensated with three filter sites
+(propagate Rust prep, gravity Louvain prep, gravity heat compute).
+v2 is cleaner — the data lives where it semantically belongs (the node,
+not a degenerate self-relationship).
+
+**Migration:** existing .stg files with v1-era self-loop intrinsic-property
+edges continue to function. The defensive 1A filter in propagate / gravity
+is retained for legacy or manually-created edges, and `STGEdge.is_intrinsic_property()`
+remains as a detection helper. New ingests via `ingest_stl` follow v2.
+Agents that want consistent storage should delete + re-ingest.
+
+Implementation:
+- `engine.py`: new `_try_materialize_intrinsic_properties()` helper +
+  `_INTRINSIC_CARRIER_KEYS = frozenset({"action", "edge_class"})`. Called
+  from both ingest paths (main `ingest_stl` + `_ingest_stl_regex` fallback)
+  before `add_edge`. Carrier keys stripped from metadata. Edge-only fields
+  (`confidence`, `strength`, `rule`, `time`) are accepted for STL syntactic
+  completeness but discarded — there is no edge to attach them to.
+
+Reference STL Protocol upgrade:
+[scos-lab/semantic-tension-language@1d22c0c](https://github.com/scos-lab/semantic-tension-language/commit/1d22c0c)
+(§9.4 v2 contract: materialize + MUST NOT create edge).
+
+26 tests rewritten in `test_intrinsic_properties.py` covering ingest
+materialization, SQLite round-trip, defensive filter, CLI rendering, and
+edge attribute thresholds.
+
+### Added — `stg attrs` command for node attribute queries
+
+Now that intrinsic properties live in `nodes.metadata_json` instead of
+edges, agents need a way to read them. `stg attrs` exposes node attributes
+through five modes:
+
+```
+stg attrs <node>                        # single-node listing
+stg attrs --namespace <ns>              # tabular listing within namespace
+stg attrs --field key=value [...]       # field-equality filter (AND)
+stg attrs --where "<sql>"               # SQL where on metadata_json
+stg attrs --keys                        # discover available metadata keys
+stg attrs --limit N                     # truncate output
+```
+
+The `--keys` mode answers the schema-discovery problem inherent to
+schema-less JSON: unlike a relational table, two nodes in the same
+namespace may carry different field sets. The output reports per-key
+**coverage** (e.g. `appid 100%, price_usd 67%`), revealing the de-facto
+field structure — analogous to "which columns are NOT NULL" but
+discovered from actual data:
+
+```
+$ stg attrs --namespace Game --keys
+Field        | Coverage
+─────────────────────────
+appid        | 3/3 (100%)
+release_year | 3/3 (100%)
+price_usd    | 2/3 (67%)
+```
+
+Engine API:
+- `STGEngine.query_node_attrs(namespace, field_filters)` — in-memory filter
+- `STGEngine.query_node_attrs_sql(where_clause, db_path, namespace)` — SQL
+  passthrough using SQLite `JSON_EXTRACT`. Single-user tool — rejects `;`
+  to prevent multi-statement injection, no further sanitization.
+- `STGEngine.query_metadata_keys(namespace, node_name)` — returns
+  `[(key, count, total_in_scope)]` sorted by count desc, then alpha.
+
+24 new tests covering all modes, sort stability, namespace isolation,
+SQL injection guard, and CLI integration.
+
+### Changed — `stg node <name>` Properties: now a one-line summary
+
+For nodes carrying many attributes (e.g. stg-steam v0.3 Game nodes with
+~30 fields), the previous full attribute listing dominated node detail
+and crowded out graph topology. `_render_node_detail` now shows:
+
+```
+Properties: 32 keys (use 'stg attrs Elden_Ring' to view)
+```
+
+Use `stg attrs <name>` for the full listing. This is consistent with the
+minimalism principle applied to edge attributes (c=, s=, sal= hidden when
+at default values, see commit `acd2118`): node detail focuses on graph
+topology; attribute values are queried explicitly when needed.
+
+### Added — `PROVENANCE_FIELDS` constant and provenance folding in `stg node`
+
+Edge modifiers in batch-ingested data tend to repeat verbatim across many
+edges of the same node — e.g. all 36 outgoing edges of `Elden_Ring` carrying
+`source="steam_appdetails"`. These provenance fields are audit-trail metadata,
+not semantic content, and crowd out the action / role / is_a fields that
+actually describe what the edge means.
+
+`stg node <name>` now folds provenance fields by default and prints a footer
+summarizing the count:
+
+```
+Outgoing (36):
+  → [FromSoftware_Inc]
+    action: developed_by
+  → [Bandai_Namco_Entertainment]
+    action: published_by
+  ...
+  (+ 36 provenance fields hidden [source/created_at/...], use --full to show)
+```
+
+Pass `--full` to expand them.
+
+Storage is unchanged — provenance still lives on the edge (audit and
+batch-rollback continue to work). This is purely a display-layer change.
+
+Implementation:
+
+- `engine.py`: new `PROVENANCE_FIELDS = frozenset({"source", "created_at",
+  "recorded_at", "superseded_at", "batch_id", "ingested_at"})`. Sibling to
+  `SEMANTIC_FIELDS` and `SUPERSEDE_SINGLE_VALUE_FIELDS`. `occurred_time` and
+  `author` are intentionally NOT in this set — they often carry semantic
+  content (event dates, attribution) rather than audit metadata.
+- `__init__.py`: export `PROVENANCE_FIELDS`.
+- `cli.py`: `_format_edge_modifiers(e, indent, show_provenance=False)` now
+  returns `(lines, hidden_count)`. Three call sites updated.
+  `_render_node_detail` accepts `show_provenance`, sums hidden across all
+  edges, and prints the footer when count > 0. `cmd_node` and the main
+  command dispatcher gain `--full` flag parsing.
+
+### Fixed — `Properties:` hint in `stg node` is now copy-paste runnable
+
+The hint shown after the properties summary used to be:
+
+```
+Properties: 32 keys (use 'stg attrs Elden_Ring' to view)
+```
+
+Two issues: (1) the agent flag was missing, so users on a non-default agent
+would have the suggested command run against the wrong `.stg`; (2) the node
+name was unquoted, which breaks for names with shell-special characters.
+
+Now emits, when on a non-default agent:
+
+```
+Properties: 32 keys (use 'stg --agent stg-steam attrs "Elden_Ring"' to view)
+```
+
+When on the default agent, the `--agent` flag is omitted but the node-name
+quoting remains (always shell-safe).
+
+Implementation in `cli.py:_render_node_detail`. Test
+`test_cli_node_renders_properties_summary` updated to tolerate optional
+`--agent` injection from `STG_AGENT` env var.
+
+## [0.5.0a7] — 2026-05-10
+
+### Added — Intrinsic-property self-loop edges (STL Protocol §9.4)
+
+Self-loops marked with `action="intrinsic_properties"` are now recognized
+as **storage-only attribute carriers** for node-identity attributes — id
+values, registration codes, fixed metadata that belong to the node itself.
+
+Use case: a node with many outgoing edges that would otherwise duplicate
+the same identity attributes (e.g. a game node with `appid` / `release_year`
+referenced by 35+ tag/genre/feature edges). Putting the attributes on a
+single self-loop carrier keeps business edges clean while keeping the data
+canonically attached to the node.
+
+Runtime contract (per STL Operational Protocol §9.4):
+
+- **Preserve** edge data in `_edges`, `_edges_lookup`, and `_graph`
+- **Exclude from propagation** — the edge is not a path; activation must
+  not flow `Node → Node` through it
+- **Exclude from community detection** — the edge does not contribute
+  to graph topology for Louvain / gravity
+- **Render distinctly** — UIs surface the modifiers as a `Properties:`
+  section in node detail views
+
+Implementation:
+
+- `types.py`: `STGEdge.is_intrinsic_property()` helper +
+  `INTRINSIC_PROPERTIES_ACTION` reserved-value constant
+- `engine.py`: filter in the `_rust_edges` build step inside
+  `_propagate_from_seeds`
+- `gravity.py`: drop intrinsic self-loops from the Louvain input in
+  `build_gravity_map`; skip them in the heat-compute loop in
+  `compute_community_signals`
+
+12 new tests cover helper detection, storage preservation, propagation
+exclusion, and community-detection exclusion. Backward compatible — no
+existing edge changes behavior; only the reserved `action` value is
+recognized.
+
+Reference STL Protocol commit:
+[scos-lab/semantic-tension-language@1d9bd5c](https://github.com/scos-lab/semantic-tension-language/commit/1d9bd5c).
+
+### Added — `stg node` Properties: section rendering
+
+`_render_node_detail` (CLI `stg node <name>` and inlined under
+community-mode `stg propagate`) now extracts intrinsic-property self-loops
+from outgoing/incoming edge lists and renders them as a dedicated
+`Properties:` section between metadata and the edge listings:
+
+```
+Node: Elden_Ring
+  Tension: 0.0000
+  Activation: 0.0000
+
+  Properties:
+    appid: 1245620
+    release_year: 2022
+    price_usd: 59.99
+
+  Outgoing (2):
+    → [Souls_Like] (c=0.95, s=0.5)
+    → [Action_RPG] (c=0.95, s=0.5)
+```
+
+Carrier-internal modifier keys (`action`, `rule`, `edge_class`,
+`_epistemic_warnings`) are suppressed from the Properties view since they
+describe the carrier convention itself, not the node identity.
+
+4 additional tests cover the rendering, exclusion from outgoing/incoming
+counts, carrier metadata suppression, and the no-Properties-when-no-
+intrinsic-edges baseline.
+
+### Documentation — STG_AGENT_GUIDE.md major revision
+
+The agent-facing guide (`stg guide`) was several versions behind the engine. Audited against 0.5.0a6 behavior and updated:
+
+- **Multi-edge supersede semantics rewritten** — the old text described the
+  pre-0.5.0a6 Path-1 behavior ("old edge marked superseded, new becomes
+  active"). Replaced with the current Path-2-only model: same (src,tgt)
+  multi-edges coexist as complementary facets; supersede flags only fire
+  on same source + same `(meta_field, value)` + DIFFERENT target.
+- **New "Meta semantic fields — required, one per edge" subsection** —
+  documents the nine SEMANTIC_FIELDS (`is_a`, `action`, `role`, `status`,
+  `phase`, `relation`, plus the legacy `type`/`kind`/`predicate`), how to
+  pick the most specific one, and that they are what drives supersede
+  detection. Bumps the "always include" count from 3 to 4.
+- **Timestamps section rewritten** — `timestamp=` → `occurred_time=` (the
+  old name was ambiguous and a known LongMemEval ingest-fallback
+  source). Documents the modifier-level `created_at` override for
+  backfilled external dataset ingests. Drops the "recorded_at not
+  implemented" line — that field is gone, merged into `created_at`.
+- **New "Dual-anchor retrieval" subsection** — documents the 0.5.0a1
+  retrieval mode: query containing ≥2 chunks that exact-match canonical
+  node names triggers the focused 🎯 Anchor-pair view (3-6 lines vs the
+  ranked-list 50-80). Includes the n-gram matching note (0.5.0a2: "Food
+  For Thought" → `Food_For_Thought_Charity_Gala`) and the all-token
+  edge-content scan (0.5.0a5).
+- **New "STL Reference" top-level section** — three-tier modifier table
+  (required / recommended / situational), namespace syntax, confidence
+  calibration table, the four usage patterns (Pointer / Event / Skill /
+  Property-Carrier), pointer to the external STL spec, and a `stl validate`
+  mention.
+
+Net change: 846 → 1013 lines, +196/-29 (plus the §9.4 Property-Carrier
+addition above).
+
+---
+
 ## [0.5.0a6] — 2026-04-30
 
 ### Fixed — `superseded_at` no longer fires on complementary multi-edges
