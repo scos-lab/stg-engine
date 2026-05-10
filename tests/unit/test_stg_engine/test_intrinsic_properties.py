@@ -884,3 +884,73 @@ def test_cli_query_endpoints_carry_namespace_prefix(capsys):
     out = capsys.readouterr().out
     assert "[Game:Elden_Ring] -> [Tag:Souls_Like]" in out
     assert "[Game:Elden_Ring] -> [Studio:FromSoftware]" in out
+
+
+# ─── Namespace case-insensitivity ──────────────────────────────────────────
+#
+# All namespace comparisons across the query surface are case-insensitive.
+# The canonical (display) form preserves whatever casing was used at ingest;
+# user input may be in any case.
+
+def test_query_nodes_namespace_case_insensitive():
+    e = _make_namespaced_engine()
+    assert {n.name for n in e.query_nodes(namespace="game", limit=100)} == \
+           {"Elden_Ring", "Stardew_Valley"}
+    assert {n.name for n in e.query_nodes(namespace="GAME", limit=100)} == \
+           {"Elden_Ring", "Stardew_Valley"}
+    assert {n.name for n in e.query_nodes(namespace="Game", limit=100)} == \
+           {"Elden_Ring", "Stardew_Valley"}
+
+
+def test_query_node_attrs_namespace_case_insensitive():
+    e = _make_steam_engine()
+    games_lower = e.query_node_attrs(namespace="game")
+    games_upper = e.query_node_attrs(namespace="GAME")
+    games_canon = e.query_node_attrs(namespace="Game")
+    assert {n.name for n in games_lower} == {n.name for n in games_canon}
+    assert {n.name for n in games_upper} == {n.name for n in games_canon}
+
+
+def test_query_metadata_keys_namespace_case_insensitive():
+    e = _make_steam_engine()
+    a = e.query_metadata_keys(namespace="game")
+    b = e.query_metadata_keys(namespace="Game")
+    assert a == b
+    assert len(a) > 0  # sanity — actually finds keys
+
+
+def test_query_node_attrs_sql_namespace_case_insensitive():
+    """SQL passthrough also uses LOWER() for namespace match."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "test.stg")
+        e = _make_steam_engine()
+        e.save(path)
+        results_lower = e.query_node_attrs_sql(
+            "JSON_EXTRACT(metadata_json, '$.appid') IS NOT NULL",
+            db_path=path, namespace="game",
+        )
+        results_canon = e.query_node_attrs_sql(
+            "JSON_EXTRACT(metadata_json, '$.appid') IS NOT NULL",
+            db_path=path, namespace="Game",
+        )
+        assert {n.name for n in results_lower} == {n.name for n in results_canon}
+        assert len(results_lower) == 3  # all 3 Game nodes
+
+
+def test_cli_dump_namespace_case_insensitive(capsys, monkeypatch):
+    from stg_engine.cli import cmd_dump
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "q")
+    e = _make_namespaced_engine()
+    cmd_dump(e, page_size=10, namespace="game")
+    out = capsys.readouterr().out
+    assert "Game:Elden_Ring" in out
+    assert "Game:Stardew_Valley" in out
+
+
+def test_cli_query_namespace_pattern_case_insensitive(capsys):
+    """`stg query game:Elden` works the same as `Game:Elden`."""
+    from stg_engine.cli import cmd_query
+    e = _make_namespaced_engine()
+    cmd_query(e, "game:Elden")
+    out = capsys.readouterr().out
+    assert "Game:Elden_Ring" in out

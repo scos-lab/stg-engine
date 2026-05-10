@@ -476,9 +476,13 @@ def cmd_query(engine, pattern, limit=20):
         # endpoint is in that namespace (otherwise `Game:Elden` would surface
         # cross-namespace mentions of "Elden" too).
         if namespace is not None:
+            ns_lower = namespace.lower()
             def _in_ns(name: str) -> bool:
                 node = engine._nodes.get(name.lower().replace("-", "_"))
-                return bool(node and node.namespace == namespace)
+                return bool(
+                    node and node.namespace is not None
+                    and node.namespace.lower() == ns_lower
+                )
             related = [e for e in related if _in_ns(e.source) or _in_ns(e.target)]
         if related:
             print(f"\nRelated edges ({len(related)}):")
@@ -510,7 +514,11 @@ def cmd_dump(engine, page_size=100, start=0, namespace=None):
     """
     all_nodes = sorted(engine._nodes.values(), key=lambda n: n.name.lower())
     if namespace is not None:
-        all_nodes = [n for n in all_nodes if n.namespace == namespace]
+        ns_lower = namespace.lower()
+        all_nodes = [
+            n for n in all_nodes
+            if n.namespace is not None and n.namespace.lower() == ns_lower
+        ]
     total_nodes = len(all_nodes)
     total_edges = len(engine._edges)
 

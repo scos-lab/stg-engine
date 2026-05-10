@@ -733,8 +733,11 @@ class STGEngine:
         """
         results: List[STGNode] = []
         has_any_filter = bool(namespace or field_filters)
+        ns_lower = namespace.lower() if namespace is not None else None
         for node in self._nodes.values():
-            if namespace is not None and node.namespace != namespace:
+            if ns_lower is not None and (
+                node.namespace is None or node.namespace.lower() != ns_lower
+            ):
                 continue
             if field_filters:
                 ok = all(
@@ -783,9 +786,12 @@ class STGEngine:
             return [(k, 1, 1) for k in sorted(node.metadata.keys())]
 
         if namespace is not None:
+            ns_lower = namespace.lower()
             scope = [
                 n for n in self._nodes.values()
-                if n.namespace == namespace and n.metadata
+                if n.namespace is not None
+                and n.namespace.lower() == ns_lower
+                and n.metadata
             ]
         else:
             scope = [n for n in self._nodes.values() if n.metadata]
@@ -841,7 +847,7 @@ class STGEngine:
         sql = f"SELECT name FROM nodes WHERE {where_clause}"
         params: tuple = ()
         if namespace is not None:
-            sql += " AND namespace = ?"
+            sql += " AND LOWER(namespace) = LOWER(?)"
             params = (namespace,)
 
         conn = sqlite3.connect(db_path)
@@ -2032,7 +2038,9 @@ class STGEngine:
         results = list(self._nodes.values())
 
         if namespace is not None:
-            results = [n for n in results if n.namespace == namespace]
+            ns_lower = namespace.lower()
+            results = [n for n in results
+                       if n.namespace is not None and n.namespace.lower() == ns_lower]
 
         if name_pattern:
             pattern_lower = name_pattern.lower()
