@@ -293,7 +293,7 @@ def test_cli_edge_attrs_hidden_when_default(capsys):
 
 
 def test_cli_edge_attrs_show_low_confidence(capsys):
-    """confidence < 0.85 is an outlier — flag it visually."""
+    """confidence < 0.5 is an outlier — flag it visually."""
     from stg_engine.cli import _render_node_detail
 
     e = STGEngine()
@@ -303,6 +303,22 @@ def test_cli_edge_attrs_show_low_confidence(capsys):
     out = capsys.readouterr().out
 
     assert "c=0.4" in out
+
+
+def test_cli_edge_attrs_hide_moderate_confidence(capsys):
+    """confidence in 0.5-0.85 range is normal LLM territory — don't display."""
+    from stg_engine.cli import _render_node_detail
+
+    e = STGEngine()
+    e.ingest_stl('[A] -> [B] ::mod(action="related", confidence=0.70)')
+    e.ingest_stl('[A] -> [C] ::mod(action="related", confidence=0.85)')
+
+    _render_node_detail(e, "A")
+    out = capsys.readouterr().out
+
+    # Both should render clean — no c= shown
+    assert "c=0.7" not in out
+    assert "c=0.85" not in out
 
 
 def test_cli_edge_attrs_show_nondefault_strength(capsys):
@@ -321,12 +337,12 @@ def test_cli_edge_attrs_show_nondefault_strength(capsys):
 
 
 def test_cli_edge_attrs_show_modified_salience(capsys):
-    """Salience moved away from confidence by Hebbian → render it."""
+    """Salience moved significantly away from confidence by Hebbian → render."""
     from stg_engine.cli import _render_node_detail
 
     e = STGEngine()
     e.ingest_stl('[A] -> [B] ::mod(action="related", confidence=0.95)')
-    # Manually move salience to simulate Hebbian strengthening
+    # Manually move salience to simulate sustained Hebbian strengthening
     edge = next(ed for ed in e._edges if ed.source == "A" and ed.target == "B")
     edge.salience = 1.50
 
@@ -334,6 +350,26 @@ def test_cli_edge_attrs_show_modified_salience(capsys):
     out = capsys.readouterr().out
 
     assert "sal=1.50" in out
+
+
+def test_cli_edge_attrs_hide_micro_salience_drift(capsys):
+    """Background Hebbian micro-adjustment (e.g. 1-2 strengthen steps) → don't show.
+
+    `_SALIENCE_DEVIATION_TOLERANCE = 0.15` ignores 1-2 strengthen steps at
+    the default rate of 0.05. Avoids cluttering output with sal= for every
+    edge after the first propagate.
+    """
+    from stg_engine.cli import _render_node_detail
+
+    e = STGEngine()
+    e.ingest_stl('[A] -> [B] ::mod(action="related", confidence=0.95)')
+    edge = next(ed for ed in e._edges if ed.source == "A" and ed.target == "B")
+    edge.salience = 0.97  # +0.02 — within tolerance, not noteworthy
+
+    _render_node_detail(e, "A")
+    out = capsys.readouterr().out
+
+    assert "sal=" not in out
 
 
 def test_cli_edge_attrs_show_rule(capsys):

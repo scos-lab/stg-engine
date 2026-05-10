@@ -1556,18 +1556,20 @@ def _is_virtual_edge(e):
 
 # Display thresholds for edge attributes — only render when the value carries
 # discriminative signal. Defaults are silent.
-_CONFIDENCE_DISPLAY_THRESHOLD = 0.85   # show c= only when below "well-established" tier
+_CONFIDENCE_DISPLAY_THRESHOLD = 0.5    # show c= only when "probable but uncertain" or worse
 _STRENGTH_DEFAULT = 0.5                # show s= only when deviating from default
-_SALIENCE_DEVIATION_TOLERANCE = 0.01   # show sal= only when Hebbian has moved it
+_SALIENCE_DEVIATION_TOLERANCE = 0.15   # show sal= only when Hebbian has moved it
+                                       # significantly (3+ strengthen steps at default rate)
 
 
 def _format_edge_attrs(edge) -> str:
     """Render the inline attribute parenthetical for an edge.
 
     Hides default/expected values; shows only outliers that carry signal:
-    - confidence: only when < 0.85 (low-confidence outlier worth flagging)
+    - confidence: only when < 0.5  (true low-confidence outlier — flag visually)
     - strength:   only when != 0.5 (non-default; matches STL export logic)
-    - salience:   only when |sal - conf| > 0.01 (Hebbian-modified)
+    - salience:   only when |sal - conf| > 0.15 (significantly Hebbian-modified;
+                  ignores background micro-adjustments from a few activations)
     - rule:       only when present
 
     Returns empty string when no attributes deserve display, leading to a
