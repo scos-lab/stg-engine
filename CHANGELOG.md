@@ -6,6 +6,78 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.0a7] — 2026-05-10
+
+### Added — Intrinsic-property self-loop edges (STL Protocol §9.4)
+
+Self-loops marked with `action="intrinsic_properties"` are now recognized
+as **storage-only attribute carriers** for node-identity attributes — id
+values, registration codes, fixed metadata that belong to the node itself.
+
+Use case: a node with many outgoing edges that would otherwise duplicate
+the same identity attributes (e.g. a game node with `appid` / `release_year`
+referenced by 35+ tag/genre/feature edges). Putting the attributes on a
+single self-loop carrier keeps business edges clean while keeping the data
+canonically attached to the node.
+
+Runtime contract (per STL Operational Protocol §9.4):
+
+- **Preserve** edge data in `_edges`, `_edges_lookup`, and `_graph`
+- **Exclude from propagation** — the edge is not a path; activation must
+  not flow `Node → Node` through it
+- **Exclude from community detection** — the edge does not contribute
+  to graph topology for Louvain / gravity
+- **Render distinctly** — UIs surface the modifiers as a `Properties:`
+  section in node detail views
+
+Implementation:
+
+- `types.py`: `STGEdge.is_intrinsic_property()` helper +
+  `INTRINSIC_PROPERTIES_ACTION` reserved-value constant
+- `engine.py`: filter in the `_rust_edges` build step inside
+  `_propagate_from_seeds`
+- `gravity.py`: drop intrinsic self-loops from the Louvain input in
+  `build_gravity_map`; skip them in the heat-compute loop in
+  `compute_community_signals`
+
+12 new tests cover helper detection, storage preservation, propagation
+exclusion, and community-detection exclusion. Backward compatible — no
+existing edge changes behavior; only the reserved `action` value is
+recognized.
+
+Reference STL Protocol commit:
+[scos-lab/semantic-tension-language@1d9bd5c](https://github.com/scos-lab/semantic-tension-language/commit/1d9bd5c).
+
+### Added — `stg node` Properties: section rendering
+
+`_render_node_detail` (CLI `stg node <name>` and inlined under
+community-mode `stg propagate`) now extracts intrinsic-property self-loops
+from outgoing/incoming edge lists and renders them as a dedicated
+`Properties:` section between metadata and the edge listings:
+
+```
+Node: Elden_Ring
+  Tension: 0.0000
+  Activation: 0.0000
+
+  Properties:
+    appid: 1245620
+    release_year: 2022
+    price_usd: 59.99
+
+  Outgoing (2):
+    → [Souls_Like] (c=0.95, s=0.5)
+    → [Action_RPG] (c=0.95, s=0.5)
+```
+
+Carrier-internal modifier keys (`action`, `rule`, `edge_class`,
+`_epistemic_warnings`) are suppressed from the Properties view since they
+describe the carrier convention itself, not the node identity.
+
+4 additional tests cover the rendering, exclusion from outgoing/incoming
+counts, carrier metadata suppression, and the no-Properties-when-no-
+intrinsic-edges baseline.
+
 ### Documentation — STG_AGENT_GUIDE.md major revision
 
 The agent-facing guide (`stg guide`) was several versions behind the engine. Audited against 0.5.0a6 behavior and updated:
@@ -33,10 +105,12 @@ The agent-facing guide (`stg guide`) was several versions behind the engine. Aud
   edge-content scan (0.5.0a5).
 - **New "STL Reference" top-level section** — three-tier modifier table
   (required / recommended / situational), namespace syntax, confidence
-  calibration table, the three usage patterns (Pointer / Event / Skill),
-  pointer to the external STL spec, and a `stl validate` mention.
+  calibration table, the four usage patterns (Pointer / Event / Skill /
+  Property-Carrier), pointer to the external STL spec, and a `stl validate`
+  mention.
 
-Net change: 846 → 1013 lines, +196/-29.
+Net change: 846 → 1013 lines, +196/-29 (plus the §9.4 Property-Carrier
+addition above).
 
 ---
 
