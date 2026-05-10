@@ -19,7 +19,7 @@ Usage:
     engine.save("memory.stg")
 """
 
-__version__ = "0.5.0a7"
+__version__ = "0.6.0a1"
 __author__ = "wuko / scos-lab"
 __license__ = "BUSL-1.1"
 __url__ = "https://github.com/scos-lab/stg-engine"

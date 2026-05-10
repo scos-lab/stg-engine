@@ -6,6 +6,102 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.0a1] — 2026-05-10
+
+### Changed (BREAKING) — STL Protocol §9.4 v2: materialize intrinsic-property self-loops to node attributes
+
+`action="intrinsic_properties"` self-loops are now treated as **surface
+syntax** for node attributes. `ingest_stl` detects the self-loop pattern
+and writes the modifiers to `nodes.metadata_json`. **No graph edge is
+created** — `_edges`, `_edges_lookup`, `_graph`, and the SQLite `edges`
+table are untouched.
+
+The previous v1 contract (0.5.0a7, commit `0aaa350`) said "preserve edge
+data + filter at consumption sites." Engines kept the self-loop as a
+structural artifact and compensated with three filter sites
+(propagate Rust prep, gravity Louvain prep, gravity heat compute).
+v2 is cleaner — the data lives where it semantically belongs (the node,
+not a degenerate self-relationship).
+
+**Migration:** existing .stg files with v1-era self-loop intrinsic-property
+edges continue to function. The defensive 1A filter in propagate / gravity
+is retained for legacy or manually-created edges, and `STGEdge.is_intrinsic_property()`
+remains as a detection helper. New ingests via `ingest_stl` follow v2.
+Agents that want consistent storage should delete + re-ingest.
+
+Implementation:
+- `engine.py`: new `_try_materialize_intrinsic_properties()` helper +
+  `_INTRINSIC_CARRIER_KEYS = frozenset({"action", "edge_class"})`. Called
+  from both ingest paths (main `ingest_stl` + `_ingest_stl_regex` fallback)
+  before `add_edge`. Carrier keys stripped from metadata. Edge-only fields
+  (`confidence`, `strength`, `rule`, `time`) are accepted for STL syntactic
+  completeness but discarded — there is no edge to attach them to.
+
+Reference STL Protocol upgrade:
+[scos-lab/semantic-tension-language@1d22c0c](https://github.com/scos-lab/semantic-tension-language/commit/1d22c0c)
+(§9.4 v2 contract: materialize + MUST NOT create edge).
+
+26 tests rewritten in `test_intrinsic_properties.py` covering ingest
+materialization, SQLite round-trip, defensive filter, CLI rendering, and
+edge attribute thresholds.
+
+### Added — `stg attrs` command for node attribute queries
+
+Now that intrinsic properties live in `nodes.metadata_json` instead of
+edges, agents need a way to read them. `stg attrs` exposes node attributes
+through five modes:
+
+```
+stg attrs <node>                        # single-node listing
+stg attrs --namespace <ns>              # tabular listing within namespace
+stg attrs --field key=value [...]       # field-equality filter (AND)
+stg attrs --where "<sql>"               # SQL where on metadata_json
+stg attrs --keys                        # discover available metadata keys
+stg attrs --limit N                     # truncate output
+```
+
+The `--keys` mode answers the schema-discovery problem inherent to
+schema-less JSON: unlike a relational table, two nodes in the same
+namespace may carry different field sets. The output reports per-key
+**coverage** (e.g. `appid 100%, price_usd 67%`), revealing the de-facto
+field structure — analogous to "which columns are NOT NULL" but
+discovered from actual data:
+
+```
+$ stg attrs --namespace Game --keys
+Field        | Coverage
+─────────────────────────
+appid        | 3/3 (100%)
+release_year | 3/3 (100%)
+price_usd    | 2/3 (67%)
+```
+
+Engine API:
+- `STGEngine.query_node_attrs(namespace, field_filters)` — in-memory filter
+- `STGEngine.query_node_attrs_sql(where_clause, db_path, namespace)` — SQL
+  passthrough using SQLite `JSON_EXTRACT`. Single-user tool — rejects `;`
+  to prevent multi-statement injection, no further sanitization.
+- `STGEngine.query_metadata_keys(namespace, node_name)` — returns
+  `[(key, count, total_in_scope)]` sorted by count desc, then alpha.
+
+24 new tests covering all modes, sort stability, namespace isolation,
+SQL injection guard, and CLI integration.
+
+### Changed — `stg node <name>` Properties: now a one-line summary
+
+For nodes carrying many attributes (e.g. stg-steam v0.3 Game nodes with
+~30 fields), the previous full attribute listing dominated node detail
+and crowded out graph topology. `_render_node_detail` now shows:
+
+```
+Properties: 32 keys (use 'stg attrs Elden_Ring' to view)
+```
+
+Use `stg attrs <name>` for the full listing. This is consistent with the
+minimalism principle applied to edge attributes (c=, s=, sal= hidden when
+at default values, see commit `acd2118`): node detail focuses on graph
+topology; attribute values are queried explicitly when needed.
+
 ### Added — `PROVENANCE_FIELDS` constant and provenance folding in `stg node`
 
 Edge modifiers in batch-ingested data tend to repeat verbatim across many

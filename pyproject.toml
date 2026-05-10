@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "stg-engine"
-version = "0.5.0a7"
+version = "0.6.0a1"
 description = "Semantic Tension Graph — cognitive memory system for AI agents (BSL 1.1, free for noncommercial use, commercial license required for businesses)"
 authors = [
     { name = "wuko", email = "contact@stl-lang.org" }
