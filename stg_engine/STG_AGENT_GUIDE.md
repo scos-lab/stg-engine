@@ -880,15 +880,27 @@ Modifiers fall into three tiers. Pick by purpose, not by alphabetical order.
 
 Subjective claims by users (e.g. "I had an amazing time", "meditation healed me") get **high confidence** (the source reliably reported it) plus **low certainty** (you doubt it's objectively true). For everyday factual content, just use confidence; certainty is for the corner case.
 
-### Three usage patterns for edges
+### Four usage patterns for edges
 
 | Pattern | What lives where | Key modifiers |
 |---|---|---|
 | **STG-as-a-Pointer** | Detail is in a `.md` file; STG stores a one-line summary + path | `path=`, `description=` (one sentence) |
 | **STG-as-an-Event** | The full content fits on the edge | `description=` or `lesson=`, `occurred_time=`, `rule="empirical"` |
 | **STG-as-a-Skill** | Edge is an executable script registration | `path=`, `executable="true"`, `interpreter=`, `args_template=`, `timeout_s=` (see §Skills) |
+| **STG-as-a-Property-Carrier** | Self-loop edge holds node-identity attributes; not a relationship | `action="intrinsic_properties"`, free-form attribute keys, `rule="definitional"` |
 
-Threshold: if your content is more than 2-3 sentences → write a `.md`, store the path. If a single `lesson=` clause says it → keep it on the edge. If it's a runnable operation → make it a Skill.
+Threshold: if your content is more than 2-3 sentences → write a `.md`, store the path. If a single `lesson=` clause says it → keep it on the edge. If it's a runnable operation → make it a Skill. If a node has many attributes that would otherwise repeat across every outgoing edge → use a Property-Carrier self-loop.
+
+**Property-Carrier example:**
+```
+[Elden_Ring] → [Elden_Ring] ::mod(
+  action="intrinsic_properties",
+  appid="1245620", release_year="2022", price_usd="59.99",
+  confidence=0.99, rule="definitional"
+)
+```
+
+Runtime: such self-loops are excluded from `propagate` and gravity community detection — the engine treats them as storage-only attribute bags. They appear as a `Properties:` section in `stg node <name>`. See STL Operational Protocol §9.4 for the full contract.
 
 ### Validation
 

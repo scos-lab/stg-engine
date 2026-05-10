@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 # Universal semantic-carrying modifier fields.
 # Used by supersede detection: when two edges share (source, field, value)
 # but differ in target, the older one is flagged as suspected_supersede.
+# Note: only fields in SUPERSEDE_SINGLE_VALUE_FIELDS actually trigger supersede
+# flagging — other fields (is_a/action/role/...) are cardinality=many by nature.
 SEMANTIC_FIELDS: Tuple[str, ...] = (
     "relation",
     "status",
@@ -28,6 +30,16 @@ SEMANTIC_FIELDS: Tuple[str, ...] = (
     "predicate",
     "phase",
 )
+
+# Subset of SEMANTIC_FIELDS where (src, field, value) repeating with different
+# targets really does mean "user changed their mind" (single-valued at any time).
+# Other fields like is_a / action / role are cardinality=many — same triple with
+# different targets is the normal pattern (e.g. one game has many features).
+SUPERSEDE_SINGLE_VALUE_FIELDS: frozenset = frozenset({"status", "phase"})
+
+# Two edges created within this window are treated as a co-declared batch, not
+# a "user updated their mind" pattern. Avoids spam-flagging during bulk ingest.
+SUPERSEDE_MIN_GAP_SECONDS: float = 60.0
 
 
 def _get_semantic_field(modifiers: Optional[dict]) -> Tuple[Optional[str], Optional[str]]:
@@ -582,10 +594,19 @@ class STGEngine:
         Heuristic: same source, same (semantic_field, semantic_value) pair
         but DIFFERENT target. The older edge is flagged, not deleted.
 
+        Two guards prevent over-flagging on cardinality=many relations:
+        (A) Only single-value fields (status / phase) trigger the check —
+            is_a / action / role / etc. are multi-value by nature.
+        (B) Edges created within SUPERSEDE_MIN_GAP_SECONDS of each other are
+            treated as co-declared batch, not correction.
+
         Returns the number of edges flagged.
         """
         new_field, new_value = _get_semantic_field(new_edge.modifiers)
         if not new_field or not new_value:
+            return 0
+        # Guard A: skip multi-value fields entirely
+        if new_field not in SUPERSEDE_SINGLE_VALUE_FIELDS:
             return 0
 
         nk = self._nk
@@ -609,6 +630,11 @@ class STGEngine:
             if other_field != new_field:
                 continue
             if str(other_value) != str(new_value):
+                continue
+            # Guard B: same-batch co-declaration, not a correction
+            other_ts = float(getattr(other, "created_at", 0.0) or 0.0)
+            if new_ts > 0.0 and other_ts > 0.0 and \
+                    abs(new_ts - other_ts) < SUPERSEDE_MIN_GAP_SECONDS:
                 continue
             other.modifiers["suspected_supersede"] = True
             other.modifiers["superseded_by"] = str(new_edge.target)
@@ -781,6 +807,7 @@ class STGEngine:
             strength = 0.5
             rule = None
             time_val = None
+            user_source = None
 
             if stmt.modifiers:
                 mod_dict = stmt.modifiers.model_dump(exclude_none=True)
@@ -792,8 +819,9 @@ class STGEngine:
                 strength = modifiers.pop("strength", 0.5)
                 rule = modifiers.pop("rule", None)
                 time_val = modifiers.pop("time", None)
-                # Avoid collision with add_edge() positional params
-                modifiers.pop("source", None)
+                # Pop to avoid collision with add_edge() positional params,
+                # but preserve user-provided `source` (provenance per STL Protocol).
+                user_source = modifiers.pop("source", None)
                 modifiers.pop("target", None)
                 modifiers.pop("session_id", None)
                 modifiers.pop("event_id", None)
@@ -825,6 +853,8 @@ class STGEngine:
                 created_at=created_at,
                 **modifiers,
             )
+            if user_source is not None:
+                edge.modifiers["source"] = user_source
             new_edges.append(edge)
             count += 1
 
@@ -893,6 +923,7 @@ class STGEngine:
             rule = None
             time_val = None
             edge_created_at = created_at
+            user_source = None
 
             mod_match = re.search(mod_pattern, line)
             if mod_match:
@@ -902,7 +933,9 @@ class STGEngine:
                 strength = float(modifiers.pop("strength", 0.5))
                 rule = modifiers.pop("rule", None)
                 time_val = modifiers.pop("time", None)
-                modifiers.pop("source", None)
+                # Preserve user-provided `source` (provenance per STL Protocol);
+                # other names popped to avoid collision with add_edge() params.
+                user_source = modifiers.pop("source", None)
                 modifiers.pop("target", None)
                 modifiers.pop("session_id", None)
                 modifiers.pop("event_id", None)
@@ -935,6 +968,8 @@ class STGEngine:
                 created_at=edge_created_at,
                 **modifiers,
             )
+            if user_source is not None:
+                edge.modifiers["source"] = user_source
             new_edges.append(edge)
             count += 1
 
@@ -1491,6 +1526,10 @@ class STGEngine:
         # Build flat edges list for Rust
         _rust_edges: List[Tuple[str, str, float, float, bool]] = []
         for (src, tgt), edge in self._edges_lookup.items():
+            # STL Protocol §9.4: intrinsic-property self-loops are storage-only
+            # attribute carriers, not propagation paths.
+            if edge.is_intrinsic_property():
+                continue
             conf = edge.confidence
             sal = edge.salience
             is_virtual = edge.modifiers.get("edge_class") == "virtual"

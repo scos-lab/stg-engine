@@ -94,6 +94,17 @@ def build_gravity_map(
         return GravityMap(built_at=_time.time())
 
     undirected = graph.to_undirected()
+
+    # STL Protocol §9.4: drop intrinsic-property self-loops from community
+    # detection input — they are not structural edges.
+    intrinsic_loops = [
+        (e.source.lower().replace("-", "_"), e.target.lower().replace("-", "_"))
+        for e in engine._edges
+        if e.is_intrinsic_property()
+    ]
+    if intrinsic_loops:
+        undirected.remove_edges_from(intrinsic_loops)
+
     resolution_names = ("coarse", "medium", "fine")
 
     # Step 1: Community detection at three resolutions
@@ -407,6 +418,9 @@ def compute_community_signals(
     # Single pass over all edges; charge communities where source+target both
     # land in the same touched community at the chosen resolution.
     for e in engine._edges:
+        # STL Protocol §9.4: intrinsic-property self-loops do not contribute heat.
+        if e.is_intrinsic_property():
+            continue
         src_comms = gravity.node_community.get(e.source.lower(), {})
         tgt_comms = gravity.node_community.get(e.target.lower(), {})
         src_c = src_comms.get(resolution)
