@@ -271,3 +271,107 @@ def test_cli_node_no_properties_section_when_no_intrinsic(capsys):
     out = capsys.readouterr().out
 
     assert "Properties:" not in out
+
+
+# ─── Edge attribute display thresholds ────────────────────────────────────
+
+def test_cli_edge_attrs_hidden_when_default(capsys):
+    """Default c=0.95, s=0.5, sal≈c values should not render — clean output."""
+    from stg_engine.cli import _render_node_detail
+
+    e = STGEngine()
+    e.ingest_stl('[A] -> [B] ::mod(action="related", confidence=0.95)')
+
+    _render_node_detail(e, "A")
+    out = capsys.readouterr().out
+
+    # The line for B should be just '→ [B]' with no parenthetical
+    assert "→ [B]" in out
+    assert "c=0.95" not in out
+    assert "s=0.5" not in out
+    assert "sal=" not in out
+
+
+def test_cli_edge_attrs_show_low_confidence(capsys):
+    """confidence < 0.85 is an outlier — flag it visually."""
+    from stg_engine.cli import _render_node_detail
+
+    e = STGEngine()
+    e.ingest_stl('[A] -> [B] ::mod(action="guesses", confidence=0.40)')
+
+    _render_node_detail(e, "A")
+    out = capsys.readouterr().out
+
+    assert "c=0.4" in out
+
+
+def test_cli_edge_attrs_show_nondefault_strength(capsys):
+    """strength != 0.5 is non-default — render it."""
+    from stg_engine.cli import _render_node_detail
+
+    e = STGEngine()
+    e.ingest_stl('[A] -> [B] ::mod(action="triggers", confidence=0.95, rule="causal", strength=0.85)')
+
+    _render_node_detail(e, "A")
+    out = capsys.readouterr().out
+
+    assert "s=0.85" in out
+    # confidence is 0.95 (well-established) so should NOT show
+    assert "c=0.95" not in out
+
+
+def test_cli_edge_attrs_show_modified_salience(capsys):
+    """Salience moved away from confidence by Hebbian → render it."""
+    from stg_engine.cli import _render_node_detail
+
+    e = STGEngine()
+    e.ingest_stl('[A] -> [B] ::mod(action="related", confidence=0.95)')
+    # Manually move salience to simulate Hebbian strengthening
+    edge = next(ed for ed in e._edges if ed.source == "A" and ed.target == "B")
+    edge.salience = 1.50
+
+    _render_node_detail(e, "A")
+    out = capsys.readouterr().out
+
+    assert "sal=1.50" in out
+
+
+def test_cli_edge_attrs_show_rule(capsys):
+    """Rule, when present, is metadata worth keeping visible."""
+    from stg_engine.cli import _render_node_detail
+
+    e = STGEngine()
+    e.ingest_stl('[A] -> [B] ::mod(action="caused", confidence=0.95, rule="empirical")')
+
+    _render_node_detail(e, "A")
+    out = capsys.readouterr().out
+
+    assert 'rule="empirical"' in out
+
+
+def test_cli_edge_attrs_combined_outliers(capsys):
+    """Multiple outliers compose into a single parenthetical."""
+    from stg_engine.cli import _format_edge_attrs
+    from stg_engine.types import STGEdge
+
+    edge = STGEdge(
+        source="A", target="B",
+        confidence=0.4, strength=0.85, salience=1.20,
+        rule="causal", modifiers={},
+    )
+    out = _format_edge_attrs(edge)
+    # All four signals should appear, comma-separated, in order
+    assert out == ' (c=0.4, s=0.85, sal=1.20, rule="causal")'
+
+
+def test_cli_edge_attrs_no_signals_returns_empty():
+    """Edge at all defaults → empty string (nothing to print)."""
+    from stg_engine.cli import _format_edge_attrs
+    from stg_engine.types import STGEdge
+
+    edge = STGEdge(
+        source="A", target="B",
+        confidence=0.95, strength=0.5, salience=0.95,
+        rule=None, modifiers={},
+    )
+    assert _format_edge_attrs(edge) == ""

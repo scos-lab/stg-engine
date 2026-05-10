@@ -1554,6 +1554,37 @@ def _is_virtual_edge(e):
     return "virtual_reason" in mods
 
 
+# Display thresholds for edge attributes — only render when the value carries
+# discriminative signal. Defaults are silent.
+_CONFIDENCE_DISPLAY_THRESHOLD = 0.85   # show c= only when below "well-established" tier
+_STRENGTH_DEFAULT = 0.5                # show s= only when deviating from default
+_SALIENCE_DEVIATION_TOLERANCE = 0.01   # show sal= only when Hebbian has moved it
+
+
+def _format_edge_attrs(edge) -> str:
+    """Render the inline attribute parenthetical for an edge.
+
+    Hides default/expected values; shows only outliers that carry signal:
+    - confidence: only when < 0.85 (low-confidence outlier worth flagging)
+    - strength:   only when != 0.5 (non-default; matches STL export logic)
+    - salience:   only when |sal - conf| > 0.01 (Hebbian-modified)
+    - rule:       only when present
+
+    Returns empty string when no attributes deserve display, leading to a
+    clean `→ [Target]` line for the common case.
+    """
+    parts = []
+    if edge.confidence < _CONFIDENCE_DISPLAY_THRESHOLD:
+        parts.append(f"c={edge.confidence}")
+    if abs(edge.strength - _STRENGTH_DEFAULT) > 0.001:
+        parts.append(f"s={edge.strength}")
+    if abs(edge.salience - edge.confidence) > _SALIENCE_DEVIATION_TOLERANCE:
+        parts.append(f"sal={edge.salience:.2f}")
+    if edge.rule:
+        parts.append(f'rule="{edge.rule}"')
+    return f" ({', '.join(parts)})" if parts else ""
+
+
 def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None):
     """Print full node detail with configurable indent.
 
@@ -1622,9 +1653,7 @@ def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None)
             header += f" [showing {limit}]"
         print(f"{header}:")
         for e in out_shown:
-            rule_str = f', rule="{e.rule}"' if e.rule else ""
-            sal_str = f", sal={e.salience:.2f}" if abs(e.salience - e.confidence) > 0.01 else ""
-            print(f"{pfx}    → [{e.target}] (c={e.confidence}, s={e.strength}{sal_str}{rule_str})")
+            print(f"{pfx}    → [{e.target}]{_format_edge_attrs(e)}")
             for line in _format_edge_modifiers(e, indent=mod_indent):
                 print(line)
         if out_truncated:
@@ -1637,9 +1666,7 @@ def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None)
             header += f" [showing {limit}]"
         print(f"{header}:")
         for e in in_shown:
-            rule_str = f', rule="{e.rule}"' if e.rule else ""
-            sal_str = f", sal={e.salience:.2f}" if abs(e.salience - e.confidence) > 0.01 else ""
-            print(f"{pfx}    ← [{e.source}] (c={e.confidence}, s={e.strength}{sal_str}{rule_str})")
+            print(f"{pfx}    ← [{e.source}]{_format_edge_attrs(e)}")
             for line in _format_edge_modifiers(e, indent=mod_indent):
                 print(line)
         if in_truncated:
