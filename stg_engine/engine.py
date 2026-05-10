@@ -8,6 +8,7 @@ Formulas execute directly on the graph. Persistence is serialization.
 """
 
 import logging
+import os
 import re
 import time as _time
 from typing import Dict, FrozenSet, List, Optional, Any, Tuple
@@ -694,6 +695,98 @@ class STGEngine:
         elif tgt is not None:
             return [e for e in self._edges if _nk(e.target) == tgt]
         return list(self._edges)
+
+    def query_node_attrs(
+        self,
+        namespace: Optional[str] = None,
+        field_filters: Optional[Dict[str, str]] = None,
+    ) -> List[STGNode]:
+        """Filter nodes by namespace and/or metadata field values.
+
+        All comparisons are string-based (metadata values are stored as strings
+        in the JSON blob). Filters compose with AND. With no filters, returns
+        all nodes that have non-empty metadata.
+
+        Args:
+            namespace: If set, keep only nodes with matching namespace.
+            field_filters: If set, keep only nodes whose metadata[k] == str(v)
+                for every (k, v).
+
+        Returns:
+            List of STGNode, sorted by name (case-insensitive).
+        """
+        results: List[STGNode] = []
+        has_any_filter = bool(namespace or field_filters)
+        for node in self._nodes.values():
+            if namespace is not None and node.namespace != namespace:
+                continue
+            if field_filters:
+                ok = all(
+                    str(node.metadata.get(k)) == str(v)
+                    for k, v in field_filters.items()
+                )
+                if not ok:
+                    continue
+            # If user specified no filters, only include nodes that actually
+            # have attributes (skip empty-metadata nodes that would clutter).
+            if not has_any_filter and not node.metadata:
+                continue
+            results.append(node)
+        results.sort(key=lambda n: n.name.lower())
+        return results
+
+    def query_node_attrs_sql(
+        self,
+        where_clause: str,
+        db_path: str,
+        namespace: Optional[str] = None,
+    ) -> List[STGNode]:
+        """Run a user-supplied SQL where-clause against nodes.metadata_json.
+
+        The clause is interpreted in SQL with metadata fields accessed via
+        `JSON_EXTRACT(metadata_json, '$.<key>')`. Example:
+            "JSON_EXTRACT(metadata_json, '$.release_year') > '2020'"
+
+        Single-user tool — no SQL injection sanitization beyond rejecting `;`
+        (multi-statement). Reads the .stg file on disk; the engine's in-memory
+        state must be saved before calling. Resulting node names are mapped
+        back to in-memory STGNode objects.
+
+        Args:
+            where_clause: SQL WHERE expression (no leading "WHERE").
+            db_path: Path to the .stg SQLite file.
+            namespace: Optional additional namespace filter (parameterized).
+
+        Returns:
+            List of STGNode (intersection of SQL results and in-memory nodes).
+
+        Raises:
+            ValueError: If db_path does not exist or where_clause contains ';'.
+        """
+        import sqlite3
+
+        if ";" in where_clause:
+            raise ValueError("';' not allowed in --where clause")
+        if not os.path.exists(db_path):
+            raise ValueError(f"SQLite file not found: {db_path}")
+
+        sql = f"SELECT name FROM nodes WHERE {where_clause}"
+        params: tuple = ()
+        if namespace is not None:
+            sql += " AND namespace = ?"
+            params = (namespace,)
+
+        conn = sqlite3.connect(db_path)
+        try:
+            cursor = conn.execute(sql, params)
+            names = [row[0] for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+        # Map back to in-memory nodes (by normalized key)
+        results = [self._nodes[self._nk(n)] for n in names if self._nk(n) in self._nodes]
+        results.sort(key=lambda n: n.name.lower())
+        return results
 
     def neighbors(self, name: str, direction: str = "out") -> List[str]:
         """Get neighbor node names (case-insensitive lookup).

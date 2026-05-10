@@ -397,3 +397,188 @@ def test_cli_edge_attrs_no_signals_returns_empty():
         rule=None, modifiers={},
     )
     assert _format_edge_attrs(edge) == ""
+
+
+# ─── stg attrs query API ───────────────────────────────────────────────────
+
+def _make_steam_engine() -> STGEngine:
+    """Build a small engine with 3 Game nodes carrying intrinsic attrs."""
+    e = STGEngine()
+    e.ingest_stl(
+        '[Game:Elden_Ring] -> [Game:Elden_Ring] ::mod('
+        'action="intrinsic_properties", appid="1245620", release_year="2022", price_usd="59.99")\n'
+        '[Game:Stardew_Valley] -> [Game:Stardew_Valley] ::mod('
+        'action="intrinsic_properties", appid="413150", release_year="2016", price_usd="14.99")\n'
+        '[Game:Counter_Strike_2] -> [Game:Counter_Strike_2] ::mod('
+        'action="intrinsic_properties", appid="730", release_year="2023")\n'
+    )
+    return e
+
+
+def test_query_node_attrs_returns_only_metadata_carrying_nodes():
+    """No filters → return only nodes that have non-empty metadata."""
+    e = _make_steam_engine()
+    e.add_node("BareNode")  # no metadata
+
+    results = e.query_node_attrs()
+    names = [n.name for n in results]
+    assert "BareNode" not in names
+    assert set(names) == {"Counter_Strike_2", "Elden_Ring", "Stardew_Valley"}
+
+
+def test_query_node_attrs_namespace_filter():
+    e = _make_steam_engine()
+    # Add an attribute-bearing node in a different namespace
+    e.ingest_stl(
+        '[Tag:Souls_Like] -> [Tag:Souls_Like] ::mod('
+        'action="intrinsic_properties", popularity="high")'
+    )
+
+    games = e.query_node_attrs(namespace="Game")
+    tags = e.query_node_attrs(namespace="Tag")
+    assert all(n.namespace == "Game" for n in games)
+    assert len(games) == 3
+    assert len(tags) == 1
+    assert tags[0].name == "Souls_Like"
+
+
+def test_query_node_attrs_field_filter():
+    e = _make_steam_engine()
+    results = e.query_node_attrs(field_filters={"release_year": "2022"})
+    assert [n.name for n in results] == ["Elden_Ring"]
+
+
+def test_query_node_attrs_combined_filters_and_semantics():
+    e = _make_steam_engine()
+    # Add a non-Game node that also has release_year=2022
+    e.ingest_stl(
+        '[Movie:Avatar2] -> [Movie:Avatar2] ::mod('
+        'action="intrinsic_properties", release_year="2022")'
+    )
+    # namespace + field — should AND-compose
+    results = e.query_node_attrs(
+        namespace="Game", field_filters={"release_year": "2022"},
+    )
+    assert [n.name for n in results] == ["Elden_Ring"]
+
+
+def test_query_node_attrs_sorted_by_name():
+    e = _make_steam_engine()
+    results = e.query_node_attrs(namespace="Game")
+    names = [n.name for n in results]
+    assert names == sorted(names, key=str.lower)
+
+
+def test_query_node_attrs_sql_basic():
+    """SQL where clause via JSON_EXTRACT."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "test.stg")
+        e = _make_steam_engine()
+        e.save(path)
+
+        results = e.query_node_attrs_sql(
+            "JSON_EXTRACT(metadata_json, '$.release_year') > '2020'",
+            db_path=path,
+        )
+        names = {n.name for n in results}
+        assert names == {"Elden_Ring", "Counter_Strike_2"}
+
+
+def test_query_node_attrs_sql_with_namespace():
+    """--namespace combines with SQL where as AND."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "test.stg")
+        e = _make_steam_engine()
+        # Sneak in a non-Game node that also matches the SQL filter
+        e.ingest_stl(
+            '[Movie:Avatar2] -> [Movie:Avatar2] ::mod('
+            'action="intrinsic_properties", release_year="2022")'
+        )
+        e.save(path)
+
+        results = e.query_node_attrs_sql(
+            "JSON_EXTRACT(metadata_json, '$.release_year') = '2022'",
+            db_path=path, namespace="Game",
+        )
+        assert [n.name for n in results] == ["Elden_Ring"]
+
+
+def test_query_node_attrs_sql_rejects_semicolons():
+    """Multi-statement SQL must be rejected to avoid injection foot-guns."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "test.stg")
+        e = _make_steam_engine()
+        e.save(path)
+        with pytest.raises(ValueError, match="';'"):
+            e.query_node_attrs_sql(
+                "1=1; DROP TABLE nodes",
+                db_path=path,
+            )
+
+
+def test_query_node_attrs_sql_missing_db():
+    e = _make_steam_engine()
+    with pytest.raises(ValueError, match="not found"):
+        e.query_node_attrs_sql(
+            "1=1", db_path="/nonexistent/path.stg",
+        )
+
+
+# ─── CLI cmd_attrs integration ─────────────────────────────────────────────
+
+def test_cli_attrs_single_node(capsys):
+    from stg_engine.cli import cmd_attrs
+    e = _make_steam_engine()
+    cmd_attrs(e, ["Elden_Ring"])
+    out = capsys.readouterr().out
+    assert "Node: Elden_Ring" in out
+    assert "appid: 1245620" in out
+    assert "release_year: 2022" in out
+
+
+def test_cli_attrs_list_namespace_mode(capsys):
+    from stg_engine.cli import cmd_attrs
+    e = _make_steam_engine()
+    cmd_attrs(e, ["--namespace", "Game"])
+    out = capsys.readouterr().out
+    # Header + each game appears in tabular form
+    assert "Node" in out
+    assert "appid" in out
+    assert "Elden_Ring" in out
+    assert "Stardew_Valley" in out
+    assert "Counter_Strike_2" in out
+    assert "(3 node(s))" in out
+
+
+def test_cli_attrs_field_filter(capsys):
+    from stg_engine.cli import cmd_attrs
+    e = _make_steam_engine()
+    cmd_attrs(e, ["--namespace", "Game", "--field", "release_year=2022"])
+    out = capsys.readouterr().out
+    assert "Elden_Ring" in out
+    assert "Stardew_Valley" not in out
+    assert "(1 node(s))" in out
+
+
+def test_cli_attrs_no_match(capsys):
+    from stg_engine.cli import cmd_attrs
+    e = _make_steam_engine()
+    cmd_attrs(e, ["--namespace", "DoesNotExist"])
+    out = capsys.readouterr().out
+    assert "No matching nodes" in out
+
+
+def test_cli_attrs_invalid_field_syntax(capsys):
+    from stg_engine.cli import cmd_attrs
+    e = _make_steam_engine()
+    cmd_attrs(e, ["--field", "not_a_pair"])
+    out = capsys.readouterr().out
+    assert "Invalid --field" in out
+
+
+def test_cli_attrs_unknown_flag(capsys):
+    from stg_engine.cli import cmd_attrs
+    e = _make_steam_engine()
+    cmd_attrs(e, ["--bogus", "value"])
+    out = capsys.readouterr().out
+    assert "Unknown flag" in out

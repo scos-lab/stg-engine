@@ -126,7 +126,7 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 # --- Settings ---
 _CLI_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1667,6 +1667,131 @@ def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None)
 
 def cmd_node(engine, name, show_virtual=False, limit=None):
     _render_node_detail(engine, name, indent="", show_virtual=show_virtual, limit=limit)
+
+
+def cmd_attrs(engine, args):
+    """Query node attributes (materialized from intrinsic-property self-loops
+    or other ingest paths that write to node.metadata).
+
+    Usage:
+        stg attrs <node>                       # single node detail
+        stg attrs --namespace <ns>             # all nodes in namespace
+        stg attrs --field key=value [...]      # field filter (multiple, AND)
+        stg attrs --where "<sql>"              # SQL where on metadata_json
+        stg attrs --limit N                    # truncate output
+
+    Combinable: --namespace can stack with --field or --where.
+
+    Examples:
+        stg attrs Elden_Ring
+        stg attrs --namespace Game
+        stg attrs --namespace Game --field release_year=2022
+        stg attrs --where "JSON_EXTRACT(metadata_json,'\$.release_year')>'2020'"
+    """
+    namespace = None
+    field_filters: Dict[str, str] = {}
+    where_clause = None
+    limit = None
+    target = None
+
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--namespace" and i + 1 < len(args):
+            namespace = args[i + 1]
+            i += 2
+        elif a == "--field" and i + 1 < len(args):
+            f = args[i + 1]
+            if "=" not in f:
+                print(f"Invalid --field: '{f}' (expected key=value)")
+                return
+            k, v = f.split("=", 1)
+            field_filters[k] = v
+            i += 2
+        elif a == "--where" and i + 1 < len(args):
+            where_clause = args[i + 1]
+            i += 2
+        elif a == "--limit" and i + 1 < len(args):
+            try:
+                limit = int(args[i + 1])
+            except ValueError:
+                print(f"Invalid --limit: {args[i + 1]}")
+                return
+            i += 2
+        elif a.startswith("--"):
+            print(f"Unknown flag: {a}")
+            return
+        else:
+            target = a
+            i += 1
+
+    # ─── Single-node mode ──────────────────────────────────────────────
+    if target and not (namespace or field_filters or where_clause):
+        _, node = _resolve_node_name(engine, target)
+        if not node:
+            print(f"Node not found: {target}")
+            return
+        print(f"Node: {node.name}")
+        if node.namespace:
+            print(f"  Namespace: {node.namespace}")
+        if not node.metadata:
+            print("  (no attributes)")
+            return
+        for k, v in node.metadata.items():
+            print(f"  {k}: {v}")
+        return
+
+    # ─── List mode ─────────────────────────────────────────────────────
+    if where_clause:
+        try:
+            results = engine.query_node_attrs_sql(
+                where_clause, db_path=STG_PATH, namespace=namespace,
+            )
+        except ValueError as e:
+            print(f"Error: {e}")
+            return
+        # Apply --field filters in-memory after the SQL where (AND composition)
+        if field_filters:
+            results = [
+                n for n in results
+                if all(str(n.metadata.get(k)) == str(v)
+                       for k, v in field_filters.items())
+            ]
+    else:
+        results = engine.query_node_attrs(
+            namespace=namespace,
+            field_filters=field_filters or None,
+        )
+
+    if not results:
+        print("No matching nodes.")
+        return
+
+    # Collect union of attribute keys for table columns
+    all_keys: set = set()
+    for n in results:
+        all_keys.update(n.metadata.keys())
+    keys = sorted(all_keys)
+
+    truncated = limit is not None and len(results) > limit
+    if limit:
+        results = results[:limit]
+
+    # Render table
+    NAME_W = 30
+    KEY_W = 16
+    header = f"{'Node':<{NAME_W}} | " + " | ".join(f"{k:<{KEY_W}}" for k in keys)
+    print(header)
+    print("─" * len(header))
+    for n in results:
+        row = " | ".join(
+            f"{str(n.metadata.get(k, ''))[:KEY_W]:<{KEY_W}}"
+            for k in keys
+        )
+        print(f"{n.name[:NAME_W]:<{NAME_W}} | {row}")
+
+    suffix = f" (truncated to {limit})" if truncated else ""
+    print(f"\n({len(results)} node(s){suffix})")
 
 
 def _save_last_ingest(new_nodes, candidates):
@@ -4378,6 +4503,8 @@ def main():
         subcmd = sys.argv[2] if len(sys.argv) >= 3 else ""
         args = sys.argv[3:] if len(sys.argv) >= 4 else []
         cmd_alias(engine, subcmd, args)
+    elif cmd == "attrs":
+        cmd_attrs(engine, sys.argv[2:])
     elif cmd == "metrics":
         cmd_metrics(engine)
     elif cmd == "importance":
