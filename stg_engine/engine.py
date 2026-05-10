@@ -2012,20 +2012,27 @@ class STGEngine:
         name_pattern: Optional[str] = None,
         anchor_type: Optional[str] = None,
         min_tension: Optional[float] = None,
+        namespace: Optional[str] = None,
         limit: int = 50,
     ) -> List[STGNode]:
         """Query nodes with filters.
 
         Args:
-            name_pattern: Substring match on node name (case-insensitive)
-            anchor_type: Filter by anchor type
-            min_tension: Minimum tension value
-            limit: Max results
+            name_pattern: Substring match on node name (case-insensitive).
+                Empty string matches all (use with `namespace` to list a whole
+                namespace).
+            anchor_type: Filter by anchor type.
+            min_tension: Minimum tension value.
+            namespace: Exact-match filter on node namespace.
+            limit: Max results.
 
         Returns:
-            Matching nodes
+            Matching nodes.
         """
         results = list(self._nodes.values())
+
+        if namespace is not None:
+            results = [n for n in results if n.namespace == namespace]
 
         if name_pattern:
             pattern_lower = name_pattern.lower()

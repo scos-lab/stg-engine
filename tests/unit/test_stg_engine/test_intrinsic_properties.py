@@ -792,3 +792,95 @@ def test_cli_dump_no_namespace_omits_prefix(capsys, monkeypatch):
     # No "namespace:" prefix when namespace is None
     assert "Plain_Node" in out
     assert ":Plain_Node" not in out
+
+
+# ─── stg query namespace-aware patterns ────────────────────────────────────
+
+def _make_namespaced_engine() -> STGEngine:
+    e = STGEngine()
+    e.ingest_stl(
+        '[Game:Elden_Ring] -> [Tag:Souls_Like] ::mod(action="has_tag", confidence=0.95)\n'
+        '[Game:Elden_Ring] -> [Studio:FromSoftware] ::mod(action="developed_by", confidence=0.99)\n'
+        '[Game:Stardew_Valley] -> [Tag:Farming] ::mod(action="has_tag", confidence=0.95)\n'
+        '[Game:Stardew_Valley] -> [Studio:ConcernedApe] ::mod(action="developed_by", confidence=0.99)\n'
+    )
+    return e
+
+
+def test_query_nodes_namespace_filter():
+    """engine.query_nodes accepts a namespace exact-match filter."""
+    e = _make_namespaced_engine()
+    games = e.query_nodes(namespace="Game", limit=100)
+    tags = e.query_nodes(namespace="Tag", limit=100)
+    assert {n.name for n in games} == {"Elden_Ring", "Stardew_Valley"}
+    assert {n.name for n in tags} == {"Souls_Like", "Farming"}
+
+
+def test_query_nodes_namespace_combines_with_pattern():
+    """`namespace=Game, name_pattern=Elden` AND-composes."""
+    e = _make_namespaced_engine()
+    results = e.query_nodes(namespace="Game", name_pattern="Elden", limit=10)
+    assert [n.name for n in results] == ["Elden_Ring"]
+
+
+def test_cli_query_namespace_listing(capsys):
+    """`stg query Game:` lists all Game-namespace nodes."""
+    from stg_engine.cli import cmd_query
+    e = _make_namespaced_engine()
+    cmd_query(e, "Game:")
+    out = capsys.readouterr().out
+    assert "Game:Elden_Ring" in out
+    assert "Game:Stardew_Valley" in out
+    # Tag and Studio nodes must NOT appear in the listing
+    assert "Tag:" not in out.split("Related edges")[0]
+    assert "Studio:" not in out.split("Related edges")[0]
+
+
+def test_cli_query_namespace_fuzzy(capsys):
+    """`stg query Game:Elden` is fuzzy match scoped to Game namespace."""
+    from stg_engine.cli import cmd_query
+    e = _make_namespaced_engine()
+    cmd_query(e, "Game:Elden")
+    out = capsys.readouterr().out
+    assert "Game:Elden_Ring" in out
+    # Stardew_Valley is in Game ns but doesn't match "Elden" — must not appear
+    assert "Stardew_Valley" not in out.split("Related edges")[0]
+
+
+def test_cli_query_no_colon_unchanged(capsys):
+    """Plain pattern (no colon) still does whole-graph fuzzy match."""
+    from stg_engine.cli import cmd_query
+    e = _make_namespaced_engine()
+    cmd_query(e, "Stardew")
+    out = capsys.readouterr().out
+    assert "Game:Stardew_Valley" in out
+
+
+def test_cli_query_namespace_isolates_related_edges(capsys):
+    """Related-edges section under `Tag:X` only includes edges touching the Tag namespace."""
+    from stg_engine.cli import cmd_query
+    e = _make_namespaced_engine()
+    cmd_query(e, "Tag:Souls")
+    out = capsys.readouterr().out
+    # Souls_Like is the matched node; edges should involve Tag namespace
+    assert "Tag:Souls_Like" in out
+    # Cross-namespace edge to Game:Elden_Ring is OK (one endpoint in Tag)
+    assert "Game:Elden_Ring" in out
+
+
+def test_cli_query_no_match(capsys):
+    from stg_engine.cli import cmd_query
+    e = _make_namespaced_engine()
+    cmd_query(e, "Nonexistent:")
+    out = capsys.readouterr().out
+    assert "No nodes matching" in out
+
+
+def test_cli_query_endpoints_carry_namespace_prefix(capsys):
+    """Related-edges section renders endpoints with namespace prefixes."""
+    from stg_engine.cli import cmd_query
+    e = _make_namespaced_engine()
+    cmd_query(e, "Elden")
+    out = capsys.readouterr().out
+    assert "[Game:Elden_Ring] -> [Tag:Souls_Like]" in out
+    assert "[Game:Elden_Ring] -> [Studio:FromSoftware]" in out

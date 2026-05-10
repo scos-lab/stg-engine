@@ -417,16 +417,37 @@ def cmd_grep(engine, pattern, limit=20, full=False):
 
 
 def cmd_query(engine, pattern, limit=20):
-    nodes = engine.query_nodes(name_pattern=pattern, limit=limit)
+    """Fuzzy node search with optional namespace scoping.
+
+    Pattern grammar:
+        <text>           — substring match across all node names (any namespace)
+        <ns>:            — list every node in `<ns>` namespace (no name filter)
+        <ns>:<text>      — substring match on name, scoped to `<ns>` namespace
+    """
+    # Parse `Namespace:NamePattern` form when a colon is present
+    if ":" in pattern:
+        ns_part, _, name_part = pattern.partition(":")
+        namespace = ns_part if ns_part else None
+        name_pattern = name_part if name_part else None
+    else:
+        namespace = None
+        name_pattern = pattern
+
+    nodes = engine.query_nodes(
+        name_pattern=name_pattern, namespace=namespace, limit=limit,
+    )
     if not nodes:
         print(f"No nodes matching '{pattern}'")
         return
-    total = len(engine.query_nodes(name_pattern=pattern, limit=10000))
+    total = len(engine.query_nodes(
+        name_pattern=name_pattern, namespace=namespace, limit=10000,
+    ))
     shown = len(nodes)
     suffix = f" (showing {shown}/{total})" if total > shown else ""
     print(f"Nodes matching '{pattern}'{suffix}:")
     for n in nodes:
-        parts = [f"  {n.name}"]
+        display = f"{n.namespace}:{n.name}" if n.namespace else n.name
+        parts = [f"  {display}"]
         if n.tension > 0:
             parts.append(f"T={n.tension:.3f}")
         if n.activation > 0:
@@ -436,24 +457,44 @@ def cmd_query(engine, pattern, limit=20):
             parts.append(f"[{comm}]")
         print(" | ".join(parts))
 
-    # Also show related edges
-    edges = engine.query_edges(limit=200)
-    related = [e for e in edges if pattern.lower() in e.source.lower() or pattern.lower() in e.target.lower()]
-    if related:
-        print(f"\nRelated edges ({len(related)}):")
-        for e in related[:10]:
-            is_virtual = e.modifiers.get("edge_class") == "virtual"
-            arrow = " ~ " if is_virtual else " -> "
-            mod = f"confidence={e.confidence}"
-            if e.rule:
-                mod += f', rule="{e.rule}"'
-            if is_virtual:
-                reason = e.modifiers.get("virtual_reason", "")
-                mod += f', virtual={reason}'
-            print(f"  [{e.source}]{arrow}[{e.target}] ::mod({mod})")
-            mod_lines, _ = _format_edge_modifiers(e, indent="    ")
-            for line in mod_lines:
-                print(line)
+    # Helper: namespace-prefixed display name for edge endpoints
+    def _ns_label(name: str) -> str:
+        node = engine._nodes.get(name.lower().replace("-", "_"))
+        if node and node.namespace:
+            return f"{node.namespace}:{name}"
+        return name
+
+    # Related edges: filter by name part (skip when listing a whole namespace)
+    if name_pattern:
+        edges = engine.query_edges(limit=200)
+        np = name_pattern.lower()
+        related = [
+            e for e in edges
+            if np in e.source.lower() or np in e.target.lower()
+        ]
+        # If a namespace was given, also restrict to edges where at least one
+        # endpoint is in that namespace (otherwise `Game:Elden` would surface
+        # cross-namespace mentions of "Elden" too).
+        if namespace is not None:
+            def _in_ns(name: str) -> bool:
+                node = engine._nodes.get(name.lower().replace("-", "_"))
+                return bool(node and node.namespace == namespace)
+            related = [e for e in related if _in_ns(e.source) or _in_ns(e.target)]
+        if related:
+            print(f"\nRelated edges ({len(related)}):")
+            for e in related[:10]:
+                is_virtual = e.modifiers.get("edge_class") == "virtual"
+                arrow = " ~ " if is_virtual else " -> "
+                mod = f"confidence={e.confidence}"
+                if e.rule:
+                    mod += f', rule="{e.rule}"'
+                if is_virtual:
+                    reason = e.modifiers.get("virtual_reason", "")
+                    mod += f', virtual={reason}'
+                print(f"  [{_ns_label(e.source)}]{arrow}[{_ns_label(e.target)}] ::mod({mod})")
+                mod_lines, _ = _format_edge_modifiers(e, indent="    ")
+                for line in mod_lines:
+                    print(line)
 
 
 def cmd_dump(engine, page_size=100, start=0, namespace=None):
