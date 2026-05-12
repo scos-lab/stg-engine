@@ -60,6 +60,94 @@ is preserved in display.
 Affected commands: `stg query <ns>:`, `stg dump --namespace`,
 `stg attrs --namespace`. Commit `ab3bc68`.
 
+### Added — HTTP server: stg-server (optional [server] extra)
+
+Resident HTTP server exposing one STG agent over a versioned JSON API.
+Designed as the substrate for AI agent knowledge bases — stg-steam Q&A
+is the first consumer; future verticals inherit the same binary via
+`--agent`.
+
+Install:
+
+```
+pip install stg-engine[server]
+stg-server --agent <name>          # default port 8765, bind 127.0.0.1
+```
+
+v1 surface (read-only — mutation stays on `stg` CLI):
+
+| Endpoint | Status | Purpose |
+|---|---|---|
+| `GET /v1/health` | shipped (commit `3273aeb`) | Liveness + agent identity + engine_mtime for staleness detection |
+| `GET /v1/stats` | shipped (commit `3273aeb`) | Full engine.get_stats() output |
+| `POST /v1/propagate` | shipped (commit `13a42e2`) | Activation propagation (read_only=True under the hood) |
+| `GET /v1/node/{name}` | shipped (commit `13a42e2`) | Single-node detail with incoming/outgoing edges |
+| `GET /v1/query` | shipped (commit `13a42e2`) | Fuzzy substring search + namespace filter |
+| `GET /v1/attrs/{name}` | M4 pending | Node metadata projection |
+| `GET /v1/paths` | M4 pending | Topology query between two anchors |
+
+Key design points:
+- **`engine.propagate(read_only=True)`** (commit `fd18059`) — HTTP path
+  skips Hebbian learning + telemetry writes so anonymous external
+  traffic doesn't shape the agent's learning signal. CLI keeps the
+  default `read_only=False`.
+- **Conditional CORS** — permissive only when `--bind` is localhost;
+  external binds get no CORS headers without an explicit allow-list.
+- **Defensive bind** — non-localhost `--bind` refuses to start without
+  `--allow-external-bind` (forces explicit decision; v1 has no auth).
+- **String-only modifiers on wire** — `EdgeOut.modifiers: dict[str,str]`,
+  matches STL ingest contract, avoids parse ambiguity for small LLMs.
+- **Provenance folding** — `metadata` excludes `source`/`created_at`/
+  etc. unless the request includes `?full=true`.
+
+Full design doc:
+`Semantic-Kernel-of-Consciousness/development/design/STG_HTTP_SERVER_DESIGN.md`
+
+Resolved open questions (§12 of design doc): HTTP propagate sees empty
+active_context (stateless RPC), HTTP-side telemetry buffered in-memory
+not in `.stg`, modifiers stringified on wire, conditional CORS, static
+`.stg` with `engine_mtime` surface for clients, Pydantic v2 hard
+requirement.
+
+27 new integration tests across `tests/integration/test_server_v1_*.py`.
+E2E verified against `~/.stg/stg-steam-g8-verify` (84 nodes / 137 edges).
+
+### Added — `stg attrs --key` projection + `--keys` tips
+
+`stg attrs <node> --key <name>` prints the bare value (pipeline-friendly
+for `$(stg attrs X --key appid)`). `stg attrs --namespace X --key Y`
+projects a single column across the namespace. `--key` and `--keys` are
+mutually exclusive (one lists key names, the other prints a value).
+
+`stg attrs ... --keys` now ends with `N keys` count + a tip pointing at
+`--key <name>` so users discover value projection. `stg node X`
+Properties hint changed from "to view" → "to list", pointing at
+`stg attrs X --keys`. Commit `3fdfca2`.
+
+### Fixed — G8 duplicate-edge detection now respects SEMANTIC_FIELDS
+
+Two edges sharing `(source, target)` but differing in their
+`SEMANTIC_FIELDS` value (`action="developed_by"` vs
+`action="published_by"` on the same Game→Company pair; same `is_a` /
+`role` / `status` / `phase` patterns) were silently collapsed on
+ingest because `is_true_duplicate` only checked
+`confidence/strength/rule/description`.
+
+Fix: new `_semantic_fingerprint(modifiers)` helper captures all
+`SEMANTIC_FIELDS` in canonical order; `is_true_duplicate` now requires
+fingerprint equality too. Thorough (all-fields) variant — also catches
+edges carrying multiple semantic fields where one value differs
+(`action="took"` + `role="tourist"` vs `action="took"` + `role="guide"`).
+
+Backward-compatible: only changes ingest paths that previously dropped
+the second edge. True duplicates (no semantic difference) still
+collapse. 6 regression tests in
+`TestDuplicateEdgePrevention::test_g8_dedup_*`.
+
+stg-steam v0.4 schema (Company namespace + dev/pub action edges) now
+ingests correctly: `FromSoftware_Inc` shows two incoming edges (one
+`developed_by`, one `published_by`) instead of one. Commit `3fdfca2`.
+
 ## [0.6.0a1] — 2026-05-10
 
 ### Changed (BREAKING) — STL Protocol §9.4 v2: materialize intrinsic-property self-loops to node attributes

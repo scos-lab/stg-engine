@@ -278,6 +278,52 @@ portability across machines is the user's responsibility via config.
 
 ---
 
+## HTTP server (optional)
+
+For AI agent knowledge bases that need to serve one STG over a JSON API,
+install the optional `server` extra and run `stg-server`:
+
+```bash
+pip install stg-engine[server]
+stg-server --agent stg-steam            # default port 8765, bind 127.0.0.1
+```
+
+The server is resident — one engine load at startup, served to many
+clients — eliminating the ~50 ms python-startup tax of subprocess
+`stg propagate` calls. Default bind is localhost; non-localhost binds
+require `--allow-external-bind` (v1 has no auth).
+
+v1 endpoints (read-only — mutation stays on `stg` CLI):
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /v1/health` | Liveness + agent identity + `.stg` file mtime for staleness detection |
+| `GET /v1/stats` | Full `engine.get_stats()` |
+| `POST /v1/propagate` | Activation propagation, `read_only=True` (no Hebbian/telemetry side-effects) |
+| `GET /v1/node/{name}` | Single-node detail with incoming/outgoing edges |
+| `GET /v1/query` | Fuzzy substring search + namespace filter |
+
+Interactive API docs at `http://127.0.0.1:8765/docs` (FastAPI auto-OpenAPI).
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:8765/v1/propagate \
+     -H "Content-Type: application/json" \
+     -d '{"query": "Elden Ring", "max_nodes": 5}'
+```
+
+**Design philosophy:** the HTTP server is JSON substrate. Anonymous
+external traffic flows through `propagate(read_only=True)` so it
+doesn't shape the agent's autonomous learning signal — agents learn
+from their own CLI propagations, not from third-party HTTP reads.
+
+Two more endpoints (`/v1/attrs/{name}`, `/v1/paths`) are pending in M4.
+Full design and decisions:
+`Semantic-Kernel-of-Consciousness/development/design/STG_HTTP_SERVER_DESIGN.md`.
+
+---
+
 ## License
 
 **STG Engine is dual-licensed:**
