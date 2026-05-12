@@ -70,6 +70,22 @@ def _get_semantic_field(modifiers: Optional[dict]) -> Tuple[Optional[str], Optio
     return None, None
 
 
+def _semantic_fingerprint(modifiers: Optional[dict]) -> Tuple[Tuple[str, str], ...]:
+    """Return a stable fingerprint of ALL semantic fields present on an edge.
+
+    Used by G8 dedup to distinguish edges that share (src, tgt, conf, strength,
+    rule, description) but differ in any SEMANTIC_FIELD value (e.g. one carries
+    action="developed_by" and another action="published_by"). Ordered by the
+    SEMANTIC_FIELDS tuple so the fingerprint is canonical regardless of dict
+    insertion order.
+    """
+    if not modifiers:
+        return ()
+    return tuple(
+        (f, str(modifiers[f])) for f in SEMANTIC_FIELDS if modifiers.get(f)
+    )
+
+
 # Skill invocation modifiers — orthogonal to SEMANTIC_FIELDS. These describe HOW
 # to invoke a Skill node (path, interpreter, timeout) rather than the semantic
 # relation between nodes. Used by the skill_runner module; see
@@ -560,7 +576,17 @@ class STGEngine:
             same_rule = (existing_edge.rule or "") == (rule or "")
             same_desc = (existing_edge.modifiers.get("description", "")
                          == modifiers.get("description", ""))
-            is_true_duplicate = same_conf and same_strength and same_rule and same_desc
+            # Distinguish edges that differ only by SEMANTIC_FIELDS (action/is_a/
+            # role/status/phase/...). Without this, the multi-facet pattern the
+            # comment block above promises (e.g. dev+pub on same Company) silently
+            # collapses to a single edge.
+            same_semantic = (
+                _semantic_fingerprint(existing_edge.modifiers)
+                == _semantic_fingerprint(modifiers)
+            )
+            is_true_duplicate = (
+                same_conf and same_strength and same_rule and same_desc and same_semantic
+            )
 
             if is_true_duplicate:
                 # True duplicate — no new information, skip

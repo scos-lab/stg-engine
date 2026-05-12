@@ -1715,7 +1715,7 @@ def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None,
         )
         print(
             f"{pfx}  Properties: {n_keys} {plural} "
-            f"(use 'stg {agent_flag}attrs \"{node.name}\"' to view)"
+            f"(use 'stg {agent_flag}attrs \"{node.name}\" --keys' to list)"
         )
 
     out_edges_all = engine.get_edges(source=name)
@@ -1794,11 +1794,13 @@ def cmd_attrs(engine, args):
         stg attrs --field key=value [...]      # field filter (multiple, AND)
         stg attrs --where "<sql>"              # SQL where on metadata_json
         stg attrs --keys                       # discover available metadata keys
+        stg attrs --key <name>                 # project a single attribute value
         stg attrs --limit N                    # truncate output
 
     Combinable:
-        --namespace stacks with --field, --where, or --keys.
+        --namespace stacks with --field, --where, or --keys / --key.
         --keys with a node argument lists that node's keys.
+        --key skips nodes that don't carry the key (no empty rows).
 
     Examples:
         stg attrs Elden_Ring
@@ -1808,6 +1810,8 @@ def cmd_attrs(engine, args):
         stg attrs --keys                          # all keys in graph
         stg attrs --namespace Game --keys         # keys + coverage in namespace
         stg attrs Elden_Ring --keys               # just the keys, no values
+        stg attrs Stardew_Valley --key appid      # single node, single value
+        stg attrs --namespace Game --key appid    # one column across namespace
     """
     namespace = None
     field_filters: Dict[str, str] = {}
@@ -1815,6 +1819,7 @@ def cmd_attrs(engine, args):
     limit = None
     target = None
     keys_only = False
+    project_key: Optional[str] = None
 
     i = 0
     while i < len(args):
@@ -1836,6 +1841,9 @@ def cmd_attrs(engine, args):
         elif a == "--keys":
             keys_only = True
             i += 1
+        elif a == "--key" and i + 1 < len(args):
+            project_key = args[i + 1]
+            i += 2
         elif a == "--limit" and i + 1 < len(args):
             try:
                 limit = int(args[i + 1])
@@ -1850,8 +1858,18 @@ def cmd_attrs(engine, args):
             target = a
             i += 1
 
+    if keys_only and project_key is not None:
+        print("Error: --keys and --key are mutually exclusive "
+              "(--keys lists key names, --key projects a value).")
+        return
+
     # ─── --keys discovery mode ─────────────────────────────────────────
     if keys_only:
+        agent_flag = (
+            f"--agent {SETTINGS['agent']} "
+            if SETTINGS.get("agent", _DEFAULT_AGENT) != _DEFAULT_AGENT
+            else ""
+        )
         if target:
             # Node-level: list this node's keys (no values, no coverage)
             items = engine.query_metadata_keys(node_name=target)
@@ -1861,6 +1879,12 @@ def cmd_attrs(engine, args):
             print(f"Node: {target}")
             for k, _, _ in items:
                 print(f"  {k}")
+            n_keys = len(items)
+            plural = "key" if n_keys == 1 else "keys"
+            print(
+                f"\n{n_keys} {plural} "
+                f"(tip: stg {agent_flag}attrs \"{target}\" --key <name>  to print a value)"
+            )
             return
         # Scope-level: namespace or whole graph, with coverage table
         items = engine.query_metadata_keys(namespace=namespace)
@@ -1878,6 +1902,11 @@ def cmd_attrs(engine, args):
             print(f"{k:<{FIELD_W}} | {count}/{total} ({pct}%)")
         scope_desc = f" in namespace '{namespace}'" if namespace else ""
         print(f"\n({len(items)} unique keys across {total} nodes{scope_desc})")
+        ns_part = f"--namespace {namespace} " if namespace else ""
+        print(
+            f"(tip: stg {agent_flag}attrs {ns_part}--key <name>  "
+            f"to project one column)"
+        )
         return
 
     # ─── Single-node mode ──────────────────────────────────────────────
@@ -1885,6 +1914,14 @@ def cmd_attrs(engine, args):
         _, node = _resolve_node_name(engine, target)
         if not node:
             print(f"Node not found: {target}")
+            return
+        if project_key is not None:
+            # Value-only output: bare value (no node header, no key label) so
+            # it composes cleanly with shell pipelines / $(...) substitution.
+            if not node.metadata or project_key not in node.metadata:
+                print(f"Node '{node.name}' has no key '{project_key}'.")
+                return
+            print(node.metadata[project_key])
             return
         print(f"Node: {node.name}")
         if node.namespace:
@@ -1922,11 +1959,19 @@ def cmd_attrs(engine, args):
         print("No matching nodes.")
         return
 
-    # Collect union of attribute keys for table columns
-    all_keys: set = set()
-    for n in results:
-        all_keys.update(n.metadata.keys())
-    keys = sorted(all_keys)
+    # --key projection: drop nodes without the key, restrict columns to one.
+    if project_key is not None:
+        results = [n for n in results if project_key in n.metadata]
+        if not results:
+            print(f"No matching nodes carry key '{project_key}'.")
+            return
+        keys = [project_key]
+    else:
+        # Collect union of attribute keys for table columns
+        all_keys: set = set()
+        for n in results:
+            all_keys.update(n.metadata.keys())
+        keys = sorted(all_keys)
 
     truncated = limit is not None and len(results) > limit
     if limit:

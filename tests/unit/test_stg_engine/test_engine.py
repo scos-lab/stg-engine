@@ -256,6 +256,70 @@ class TestDuplicateEdgePrevention:
         # Lookup A→B points to conf=0.3 (latest)
         assert engine._edges_lookup[("a", "b")].confidence == 0.3
 
+    def test_g8_dedup_distinguishes_action_value(self):
+        """Same (src,tgt) with different `action` values → both edges survive.
+
+        Regression for G8 dedup gap: previously the second edge was silently
+        dropped because is_true_duplicate ignored SEMANTIC_FIELDS. stg-steam
+        v0.4 hit this on Game ↔ Company (developed_by + published_by).
+        """
+        engine = STGEngine()
+        engine.add_edge("Game", "Company", confidence=1.0, action="developed_by")
+        engine.add_edge("Game", "Company", confidence=1.0, action="published_by")
+        edges = [e for e in engine._edges if e.target == "Company"]
+        assert len(edges) == 2
+        assert {e.modifiers.get("action") for e in edges} == {"developed_by", "published_by"}
+
+    def test_g8_dedup_distinguishes_is_a_value(self):
+        """Same (src,tgt) with different `is_a` values → both edges survive."""
+        engine = STGEngine()
+        engine.add_edge("X", "Y", confidence=1.0, is_a="category_a")
+        engine.add_edge("X", "Y", confidence=1.0, is_a="category_b")
+        edges = [e for e in engine._edges if e.target == "Y"]
+        assert len(edges) == 2
+
+    def test_g8_dedup_complementary_facets_coexist(self):
+        """Different semantic *fields* (action vs status) also coexist.
+
+        Mirrors the example in the comment on engine.py G8 block: action="took"
+        vs status="had_amazing_time" on same (src,tgt).
+        """
+        engine = STGEngine()
+        engine.add_edge("Trip", "Yosemite", confidence=1.0, action="took")
+        engine.add_edge("Trip", "Yosemite", confidence=1.0, status="had_amazing_time")
+        edges = [e for e in engine._edges if e.target == "Yosemite"]
+        assert len(edges) == 2
+
+    def test_g8_dedup_multi_semantic_field_value_change(self):
+        """Edges carrying multiple SEMANTIC_FIELDS where one value differs.
+
+        Verifies the fingerprint (all-fields) comparison: edges sharing
+        action='took' but differing in role still create a second edge.
+        Minimal (first-field-only) patch would FAIL this test.
+        """
+        engine = STGEngine()
+        engine.add_edge("Trip", "Tokyo", confidence=1.0, action="took", role="tourist")
+        engine.add_edge("Trip", "Tokyo", confidence=1.0, action="took", role="guide")
+        edges = [e for e in engine._edges if e.target == "Tokyo"]
+        assert len(edges) == 2
+        assert {e.modifiers.get("role") for e in edges} == {"tourist", "guide"}
+
+    def test_g8_dedup_still_collapses_true_duplicate_with_action(self):
+        """Two genuinely identical edges (same action value) still dedup."""
+        engine = STGEngine()
+        e1 = engine.add_edge("X", "Y", confidence=1.0, action="did_thing")
+        e2 = engine.add_edge("X", "Y", confidence=1.0, action="did_thing")
+        assert e1 is e2
+        assert len([e for e in engine._edges if e.target == "Y"]) == 1
+
+    def test_g8_dedup_no_semantic_field_still_collapses(self):
+        """Edges with no semantic field (only conf/strength) still dedup."""
+        engine = STGEngine()
+        e1 = engine.add_edge("X", "Y", confidence=0.9, strength=0.5)
+        e2 = engine.add_edge("X", "Y", confidence=0.9, strength=0.5)
+        assert e1 is e2
+        assert len([e for e in engine._edges if e.target == "Y"]) == 1
+
 
 class TestSTGEngineSTLImport:
     def test_ingest_simple_stl(self):
