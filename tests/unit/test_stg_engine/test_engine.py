@@ -256,6 +256,70 @@ class TestDuplicateEdgePrevention:
         # Lookup A→B points to conf=0.3 (latest)
         assert engine._edges_lookup[("a", "b")].confidence == 0.3
 
+    def test_g8_dedup_distinguishes_action_value(self):
+        """Same (src,tgt) with different `action` values → both edges survive.
+
+        Regression for G8 dedup gap: previously the second edge was silently
+        dropped because is_true_duplicate ignored SEMANTIC_FIELDS. stg-steam
+        v0.4 hit this on Game ↔ Company (developed_by + published_by).
+        """
+        engine = STGEngine()
+        engine.add_edge("Game", "Company", confidence=1.0, action="developed_by")
+        engine.add_edge("Game", "Company", confidence=1.0, action="published_by")
+        edges = [e for e in engine._edges if e.target == "Company"]
+        assert len(edges) == 2
+        assert {e.modifiers.get("action") for e in edges} == {"developed_by", "published_by"}
+
+    def test_g8_dedup_distinguishes_is_a_value(self):
+        """Same (src,tgt) with different `is_a` values → both edges survive."""
+        engine = STGEngine()
+        engine.add_edge("X", "Y", confidence=1.0, is_a="category_a")
+        engine.add_edge("X", "Y", confidence=1.0, is_a="category_b")
+        edges = [e for e in engine._edges if e.target == "Y"]
+        assert len(edges) == 2
+
+    def test_g8_dedup_complementary_facets_coexist(self):
+        """Different semantic *fields* (action vs status) also coexist.
+
+        Mirrors the example in the comment on engine.py G8 block: action="took"
+        vs status="had_amazing_time" on same (src,tgt).
+        """
+        engine = STGEngine()
+        engine.add_edge("Trip", "Yosemite", confidence=1.0, action="took")
+        engine.add_edge("Trip", "Yosemite", confidence=1.0, status="had_amazing_time")
+        edges = [e for e in engine._edges if e.target == "Yosemite"]
+        assert len(edges) == 2
+
+    def test_g8_dedup_multi_semantic_field_value_change(self):
+        """Edges carrying multiple SEMANTIC_FIELDS where one value differs.
+
+        Verifies the fingerprint (all-fields) comparison: edges sharing
+        action='took' but differing in role still create a second edge.
+        Minimal (first-field-only) patch would FAIL this test.
+        """
+        engine = STGEngine()
+        engine.add_edge("Trip", "Tokyo", confidence=1.0, action="took", role="tourist")
+        engine.add_edge("Trip", "Tokyo", confidence=1.0, action="took", role="guide")
+        edges = [e for e in engine._edges if e.target == "Tokyo"]
+        assert len(edges) == 2
+        assert {e.modifiers.get("role") for e in edges} == {"tourist", "guide"}
+
+    def test_g8_dedup_still_collapses_true_duplicate_with_action(self):
+        """Two genuinely identical edges (same action value) still dedup."""
+        engine = STGEngine()
+        e1 = engine.add_edge("X", "Y", confidence=1.0, action="did_thing")
+        e2 = engine.add_edge("X", "Y", confidence=1.0, action="did_thing")
+        assert e1 is e2
+        assert len([e for e in engine._edges if e.target == "Y"]) == 1
+
+    def test_g8_dedup_no_semantic_field_still_collapses(self):
+        """Edges with no semantic field (only conf/strength) still dedup."""
+        engine = STGEngine()
+        e1 = engine.add_edge("X", "Y", confidence=0.9, strength=0.5)
+        e2 = engine.add_edge("X", "Y", confidence=0.9, strength=0.5)
+        assert e1 is e2
+        assert len([e for e in engine._edges if e.target == "Y"]) == 1
+
 
 class TestSTGEngineSTLImport:
     def test_ingest_simple_stl(self):
@@ -670,4 +734,66 @@ class TestPropagateNormalize:
         engine.add_edge("B", "C", confidence=0.8)
         # Just verify default runs (normalize=True is default)
         result = engine.propagate("A")
+        assert isinstance(result, list)
+
+
+class TestPropagateReadOnly:
+    """propagate(read_only=True) must skip ALL write side-effects.
+
+    Used by the HTTP server (stg_engine.server) so external traffic doesn't
+    shape the agent's learning signal or pollute telemetry. CLI keeps the
+    default read_only=False to preserve the full learning loop.
+    """
+
+    def _build_engine_with_hooks(self):
+        engine = STGEngine()
+        engine.add_edge("Game", "Company", confidence=0.9)
+        engine.add_edge("Game", "Genre", confidence=0.9)
+        engine.add_edge("Company", "Country", confidence=0.8)
+        engine.enable_learning()
+        engine.enable_telemetry()
+        return engine
+
+    def test_read_only_true_skips_hebbian_learning(self):
+        """With read_only=True, _learning_log must NOT grow."""
+        engine = self._build_engine_with_hooks()
+        before = len(engine._learning_log)
+        engine.propagate("Game Company", read_only=True)
+        assert len(engine._learning_log) == before
+
+    def test_read_only_true_skips_telemetry(self):
+        """With read_only=True, telemetry counters must NOT advance."""
+        engine = self._build_engine_with_hooks()
+        before = len(engine._telemetry._propagations) if engine._telemetry else 0
+        engine.propagate("Game Company", read_only=True)
+        after = len(engine._telemetry._propagations) if engine._telemetry else 0
+        assert after == before
+
+    def test_read_only_false_default_preserves_learning(self):
+        """Default (read_only=False) keeps Hebbian + telemetry alive."""
+        engine = self._build_engine_with_hooks()
+        before_log = len(engine._learning_log)
+        before_tel = len(engine._telemetry._propagations)
+        engine.propagate("Game Company")  # default read_only=False
+        # At least one of the two should advance; for a connected graph
+        # propagate normally produces both learning events and a telemetry tick.
+        assert (
+            len(engine._learning_log) > before_log
+            or len(engine._telemetry._propagations) > before_tel
+        )
+
+    def test_read_only_returns_same_activations_as_default(self):
+        """read_only=True must not change the answer, only suppress side-effects."""
+        engine_a = self._build_engine_with_hooks()
+        engine_b = self._build_engine_with_hooks()
+        result_default = engine_a.propagate("Game Company")
+        result_read_only = engine_b.propagate("Game Company", read_only=True)
+        assert result_default == result_read_only
+
+    def test_read_only_works_without_learner_or_telemetry(self):
+        """Engine with no hooks attached still accepts read_only without crashing."""
+        engine = STGEngine()
+        engine.add_edge("A", "B", confidence=0.9)
+        # No enable_hebbian_learning / enable_telemetry — both hooks are None
+        result = engine.propagate("A", read_only=True)
         assert isinstance(result, list)

@@ -1027,3 +1027,57 @@ These drive two recall mechanisms:
 - **Temporal queries** — `temporal range <date>` reads `created_at` (ingest/replay time), not `occurred_time` (event time). Use `occurred_time` filters in `propagate` / `node` output to find by event date.
 
 Don't confuse: `created_at` is **always present, always engine-set** (or modifier-overridden during backfill). `occurred_time` is **optional, always you-set** for events with real dates. `last_used` is engine bookkeeping for Hebbian decay.
+
+---
+
+## Serving STG over HTTP
+
+For AI agent knowledge bases that consume STG remotely (Q&A pipelines, web frontends, other-language clients), install the optional `server` extra and run `stg-server`:
+
+```bash
+pip install stg-engine[server]
+stg-server --agent <name>            # default port 8765, bind 127.0.0.1
+```
+
+One engine load at startup, served to many clients. Read-only in v1 — mutation stays on `stg` CLI.
+
+### Endpoints (v1)
+
+- `GET /v1/health` — liveness, agent name, node/edge counts, `engine_mtime` (staleness signal)
+- `GET /v1/stats` — full `engine.get_stats()`
+- `POST /v1/propagate` — activation propagation. Body: `{query, max_nodes?, include_edges?, edge_limit_per_node?, full?}`
+- `GET /v1/node/{name}?full=&edge_limit=` — single-node detail with incoming/outgoing edges
+- `GET /v1/query?pattern=&namespace=&limit=` — fuzzy substring search; empty pattern + namespace lists everything in that namespace
+
+Interactive Swagger UI at `/docs`; raw schema at `/openapi.json`.
+
+### What's different from CLI propagate
+
+HTTP `/v1/propagate` always runs with `read_only=True` — **no Hebbian salience updates, no telemetry counters, no `last_used` mutation**. Anonymous external traffic (web hits, Q&A page views, third-party agent probes) doesn't shape your agent's autonomous learning signal. CLI `stg propagate` keeps the default `read_only=False` so the agent still learns from its own intentional propagations.
+
+The HTTP response intentionally omits CLI's "community" rendering — you get a ranked list of `ActivatedNodeOut` with per-node top-N outgoing edges, plus `elapsed_ms` / `seed_count` / `activated_count` / `truncated`. Clients that want CLI's community grouping should compute it from the edges themselves.
+
+### Production-ish considerations
+
+- **Auth**: v1 has none. Default `--bind 127.0.0.1` is the only safe configuration. Non-localhost binds refuse to start without `--allow-external-bind` (defensive opt-in).
+- **CORS**: permissive (`*`) only when bound to localhost — lets browser prototypes hit the API zero-config. External binds get no CORS header.
+- **Hot reload**: not supported in v1. If you `stg ingest-file` while the server runs, the in-memory engine goes stale. `engine_mtime` is surfaced via `/v1/health` so clients can detect drift and restart the server.
+- **Concurrency cap**: `--max-concurrent-propagate N` (M4-wired) bounds simultaneous propagate calls to protect CPU on shared servers.
+- **Modifiers on the wire**: every `EdgeOut.modifiers` value is a string (matches STL ingest contract; no integer/boolean ambiguity for small-LLM JSON parsing).
+
+### Example
+
+```bash
+# Propagate against a Steam-games KB
+curl -X POST http://127.0.0.1:8765/v1/propagate \
+  -H "Content-Type: application/json" \
+  -d '{"query": "Elden Ring", "max_nodes": 5, "edge_limit_per_node": 3}'
+
+# Single-node detail
+curl 'http://127.0.0.1:8765/v1/node/FromSoftware_Inc?edge_limit=10'
+
+# Namespace listing
+curl 'http://127.0.0.1:8765/v1/query?pattern=&namespace=Game&limit=20'
+```
+
+`/v1/attrs/{name}` and `/v1/paths` ship in M4. Full design + open-question resolutions at `Semantic-Kernel-of-Consciousness/development/design/STG_HTTP_SERVER_DESIGN.md`.

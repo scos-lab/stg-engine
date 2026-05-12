@@ -31,10 +31,16 @@ classifiers = [
 
 [project.optional-dependencies]
 viz = ["plotly>=5.0"]
-dev = ["pytest>=7.0", "pytest-cov", "ruff"]
+dev = ["pytest>=7.0", "pytest-cov", "ruff", "httpx>=0.27"]
+server = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.0",
+]
 
 [project.scripts]
 stg = "stg_engine.cli:main"
+stg-server = "stg_engine.server.main:main"
 
 [project.urls]
 Homepage = "https://stl-lang.org"
