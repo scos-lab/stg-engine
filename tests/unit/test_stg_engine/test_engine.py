@@ -735,3 +735,65 @@ class TestPropagateNormalize:
         # Just verify default runs (normalize=True is default)
         result = engine.propagate("A")
         assert isinstance(result, list)
+
+
+class TestPropagateReadOnly:
+    """propagate(read_only=True) must skip ALL write side-effects.
+
+    Used by the HTTP server (stg_engine.server) so external traffic doesn't
+    shape the agent's learning signal or pollute telemetry. CLI keeps the
+    default read_only=False to preserve the full learning loop.
+    """
+
+    def _build_engine_with_hooks(self):
+        engine = STGEngine()
+        engine.add_edge("Game", "Company", confidence=0.9)
+        engine.add_edge("Game", "Genre", confidence=0.9)
+        engine.add_edge("Company", "Country", confidence=0.8)
+        engine.enable_learning()
+        engine.enable_telemetry()
+        return engine
+
+    def test_read_only_true_skips_hebbian_learning(self):
+        """With read_only=True, _learning_log must NOT grow."""
+        engine = self._build_engine_with_hooks()
+        before = len(engine._learning_log)
+        engine.propagate("Game Company", read_only=True)
+        assert len(engine._learning_log) == before
+
+    def test_read_only_true_skips_telemetry(self):
+        """With read_only=True, telemetry counters must NOT advance."""
+        engine = self._build_engine_with_hooks()
+        before = len(engine._telemetry._propagations) if engine._telemetry else 0
+        engine.propagate("Game Company", read_only=True)
+        after = len(engine._telemetry._propagations) if engine._telemetry else 0
+        assert after == before
+
+    def test_read_only_false_default_preserves_learning(self):
+        """Default (read_only=False) keeps Hebbian + telemetry alive."""
+        engine = self._build_engine_with_hooks()
+        before_log = len(engine._learning_log)
+        before_tel = len(engine._telemetry._propagations)
+        engine.propagate("Game Company")  # default read_only=False
+        # At least one of the two should advance; for a connected graph
+        # propagate normally produces both learning events and a telemetry tick.
+        assert (
+            len(engine._learning_log) > before_log
+            or len(engine._telemetry._propagations) > before_tel
+        )
+
+    def test_read_only_returns_same_activations_as_default(self):
+        """read_only=True must not change the answer, only suppress side-effects."""
+        engine_a = self._build_engine_with_hooks()
+        engine_b = self._build_engine_with_hooks()
+        result_default = engine_a.propagate("Game Company")
+        result_read_only = engine_b.propagate("Game Company", read_only=True)
+        assert result_default == result_read_only
+
+    def test_read_only_works_without_learner_or_telemetry(self):
+        """Engine with no hooks attached still accepts read_only without crashing."""
+        engine = STGEngine()
+        engine.add_edge("A", "B", confidence=0.9)
+        # No enable_hebbian_learning / enable_telemetry — both hooks are None
+        result = engine.propagate("A", read_only=True)
+        assert isinstance(result, list)

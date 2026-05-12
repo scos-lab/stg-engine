@@ -1533,6 +1533,7 @@ class STGEngine:
         iterations: int = 5,
         threshold: float = 0.10,
         normalize: bool = True,
+        read_only: bool = False,
     ) -> List[str]:
         """Activate nodes matching input and propagate through graph.
 
@@ -1545,6 +1546,11 @@ class STGEngine:
             normalize: If True, enforce global activation budget (Braitenberg
                 Vehicle 12 threshold control). Total activation is conserved
                 so nodes compete for limited activation resources.
+            read_only: If True, skip all write side-effects — no Hebbian
+                salience updates, no telemetry recording. Used by the HTTP
+                server so anonymous external traffic doesn't shape the
+                agent's learning signal. CLI defaults to False (full
+                learning loop).
 
         Returns:
             List of activated node names, sorted by activation descending
@@ -1738,6 +1744,7 @@ class STGEngine:
             input_text=input_text,
             token_count=len(tokens),
             seed_count=len(matching_hits),
+            read_only=read_only,
         )
 
     def _propagate_from_seeds(
@@ -1750,11 +1757,16 @@ class STGEngine:
         input_text: str = "",
         token_count: int = 0,
         seed_count: int = 0,
+        read_only: bool = False,
     ) -> List[str]:
         """Core propagation loop from pre-built activation seeds.
 
         Extracted from propagate() for reuse by perceive_and_propagate().
         All parameters and behavior identical to the original inner loop.
+
+        When read_only=True, the Hebbian + telemetry write tail is skipped.
+        Used by the HTTP server so anonymous external traffic doesn't shape
+        the agent's learning signal.
         """
         # Get importance field if importance bias is enabled
         importance = None
@@ -1853,28 +1865,33 @@ class STGEngine:
             top_nodes=[(self._dn(n), a) for n, a in activated[:10]],
         )
 
-        # Hebbian learning hook (Phase 7B)
-        learning_events = []
-        if self._learner is not None:
-            learning_events = self._learner.learn_from_propagation(
-                self, activation_map
-            )
-            self._learning_log.extend(learning_events)
+        # Hebbian learning + telemetry side-effects. Skipped under read_only=True
+        # (HTTP server path) so external traffic doesn't shape the agent's
+        # learning signal or pollute telemetry counters meant for the agent's
+        # own CLI propagations.
+        if not read_only:
+            # Hebbian learning hook (Phase 7B)
+            learning_events = []
+            if self._learner is not None:
+                learning_events = self._learner.learn_from_propagation(
+                    self, activation_map
+                )
+                self._learning_log.extend(learning_events)
 
-        # Telemetry hook (Phase 10)
-        if self._telemetry is not None:
-            strengthen_count = sum(
-                1 for e in learning_events if e.event_type == "strengthen"
-            )
-            weaken_count = sum(
-                1 for e in learning_events if e.event_type == "weaken"
-            )
-            self._telemetry.record_propagation(
-                self._last_propagation_metrics, activation_map,
-                strengthen_count, weaken_count,
-            )
-            if learning_events:
-                self._telemetry.record_edge_mutations(learning_events)
+            # Telemetry hook (Phase 10)
+            if self._telemetry is not None:
+                strengthen_count = sum(
+                    1 for e in learning_events if e.event_type == "strengthen"
+                )
+                weaken_count = sum(
+                    1 for e in learning_events if e.event_type == "weaken"
+                )
+                self._telemetry.record_propagation(
+                    self._last_propagation_metrics, activation_map,
+                    strengthen_count, weaken_count,
+                )
+                if learning_events:
+                    self._telemetry.record_edge_mutations(learning_events)
 
         return [self._dn(name) for name, _ in activated]
 
