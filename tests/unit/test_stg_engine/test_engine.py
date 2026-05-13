@@ -360,12 +360,90 @@ class TestSTGEngineSTLImport:
         assert count == 1
         edges = engine.get_edges("A", "B")
         assert len(edges) == 1
-        assert edges[0].confidence == 0.5  # Default
+        # v1.2 Protocol §4.2.1 — confidence defaults to 1.0 (assertive analytic)
+        assert edges[0].confidence == 1.0
 
     def test_ingest_ascii_arrow(self):
         engine = STGEngine()
         count = engine.ingest_stl('[X] -> [Y] ::mod(confidence=0.7)')
         assert count == 1
+
+
+class TestSTLProtocolV12Defaults:
+    """v1.2 Operational Protocol §4.2 — default value omission.
+
+    confidence defaults to 1.0 (assertive analytic); rule is inferred from
+    the meta-semantic field when omitted (§4.2.2).
+    """
+
+    def test_is_a_infers_definitional(self):
+        engine = STGEngine()
+        engine.ingest_stl('[Cat] -> [Mammal] ::mod(is_a="taxonomy")')
+        edges = engine.get_edges("Cat", "Mammal")
+        assert edges[0].rule == "definitional"
+        assert edges[0].confidence == 1.0
+
+    def test_role_infers_definitional(self):
+        engine = STGEngine()
+        engine.ingest_stl('[Phase12] -> [SpecDoc] ::mod(role="specification")')
+        edges = engine.get_edges("Phase12", "SpecDoc")
+        assert edges[0].rule == "definitional"
+
+    def test_action_with_strength_infers_causal(self):
+        engine = STGEngine()
+        engine.ingest_stl('[Rain] -> [Flood] ::mod(action="triggers", strength=0.9)')
+        edges = engine.get_edges("Rain", "Flood")
+        assert edges[0].rule == "causal"
+
+    def test_action_with_cause_infers_causal(self):
+        engine = STGEngine()
+        engine.ingest_stl('[X] -> [Y] ::mod(action="produces", cause="pressure")')
+        edges = engine.get_edges("X", "Y")
+        assert edges[0].rule == "causal"
+
+    def test_action_with_lesson_infers_empirical(self):
+        engine = STGEngine()
+        engine.ingest_stl('[Token] -> [Failure] ::mod(action="causes", lesson="expires in 7 days")')
+        edges = engine.get_edges("Token", "Failure")
+        assert edges[0].rule == "empirical"
+
+    def test_action_alone_infers_empirical(self):
+        engine = STGEngine()
+        engine.ingest_stl('[A] -> [B] ::mod(action="does_something")')
+        edges = engine.get_edges("A", "B")
+        assert edges[0].rule == "empirical"
+
+    def test_status_infers_empirical(self):
+        engine = STGEngine()
+        engine.ingest_stl('[Module] -> [State] ::mod(status="deprecated")')
+        edges = engine.get_edges("Module", "State")
+        assert edges[0].rule == "empirical"
+
+    def test_phase_infers_temporal(self):
+        engine = STGEngine()
+        engine.ingest_stl('[Boot] -> [System] ::mod(phase="initialization")')
+        edges = engine.get_edges("Boot", "System")
+        assert edges[0].rule == "temporal"
+
+    def test_no_meta_field_defaults_definitional(self):
+        engine = STGEngine()
+        engine.ingest_stl('[A] -> [B]')
+        edges = engine.get_edges("A", "B")
+        assert edges[0].rule == "definitional"
+
+    def test_explicit_rule_overrides_inference(self):
+        engine = STGEngine()
+        # is_a would normally infer definitional, but explicit rule="logical" wins
+        engine.ingest_stl('[X] -> [Y] ::mod(is_a="category", rule="logical")')
+        edges = engine.get_edges("X", "Y")
+        assert edges[0].rule == "logical"
+
+    def test_explicit_confidence_preserved(self):
+        engine = STGEngine()
+        engine.ingest_stl('[A] -> [B] ::mod(action="causes", confidence=0.95)')
+        edges = engine.get_edges("A", "B")
+        assert edges[0].confidence == 0.95
+        assert edges[0].rule == "empirical"  # still inferred from action
 
 
 class TestSTGEngineComputation:

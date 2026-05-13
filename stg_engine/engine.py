@@ -113,6 +113,45 @@ def _truthy(val) -> bool:
     return str(val).strip().lower() in ("true", "1", "yes", "on")
 
 
+def _infer_rule_from_meta(modifiers: dict, has_strength: bool = False) -> Optional[str]:
+    """Infer `rule` from meta-semantic field per STL Operational Protocol §4.2.2.
+
+    Called during STL ingest when the parsed edge has no explicit `rule="..."`.
+    Returns the inferred rule name, or None if no meta-semantic field is present
+    (caller falls back to "definitional" per the §4.2.2 last row).
+
+    Inference table (matches Operational Protocol §4.2.2):
+      is_a / role / type / kind / relation / predicate  → "definitional"
+      action + (cause / effect / strength)              → "causal"
+      action + lesson                                   → "empirical"
+      action  (no companion)                            → "empirical"
+      status                                            → "empirical"
+      phase                                             → "temporal"
+      (no meta field)                                   → None (caller defaults to "definitional")
+    """
+    if not modifiers:
+        return None
+    if "action" in modifiers:
+        if has_strength or "cause" in modifiers or "effect" in modifiers:
+            return "causal"
+        if "lesson" in modifiers:
+            return "empirical"
+        return "empirical"
+    for field_name, inferred in (
+        ("is_a", "definitional"),
+        ("role", "definitional"),
+        ("type", "definitional"),
+        ("kind", "definitional"),
+        ("status", "empirical"),
+        ("phase", "temporal"),
+        ("relation", "definitional"),
+        ("predicate", "definitional"),
+    ):
+        if field_name in modifiers:
+            return inferred
+    return None
+
+
 def _get_skill_invocation(modifiers: Optional[dict]) -> dict:
     """Extract the skill invocation subset from an edge's modifiers.
 
@@ -480,7 +519,7 @@ class STGEngine:
         self,
         source: str,
         target: str,
-        confidence: float = 0.5,
+        confidence: float = 1.0,  # v1.2 Protocol §4.2.1 default (was 0.5 pre-v1.2)
         strength: float = 0.5,
         rule: Optional[str] = None,
         time: Optional[str] = None,
@@ -1035,8 +1074,11 @@ class STGEngine:
             tgt_ns, tgt_name = self._parse_anchor_name(target)
 
             # Extract modifiers
+            # v1.2 (Protocol §4.2): confidence defaults to 1.0 (analytic assertive);
+            # rule defaults to inference from meta-semantic field, falling back to
+            # "definitional" if no meta field present.
             modifiers = {}
-            confidence = 0.5
+            confidence = 1.0
             strength = 0.5
             rule = None
             time_val = None
@@ -1048,9 +1090,13 @@ class STGEngine:
                 custom = mod_dict.pop("custom", {})
                 modifiers = {**mod_dict, **custom}
 
-                confidence = modifiers.pop("confidence", 0.5)
-                strength = modifiers.pop("strength", 0.5)
+                confidence = modifiers.pop("confidence", 1.0)
+                strength_raw = modifiers.pop("strength", None)
+                strength = float(strength_raw) if strength_raw is not None else 0.5
                 rule = modifiers.pop("rule", None)
+                # v1.2 §4.2.2 — infer rule from meta-semantic field if absent
+                if rule is None:
+                    rule = _infer_rule_from_meta(modifiers, has_strength=strength_raw is not None)
                 time_val = modifiers.pop("time", None)
                 # Pop to avoid collision with add_edge() positional params,
                 # but preserve user-provided `source` (provenance per STL Protocol).
@@ -1062,6 +1108,11 @@ class STGEngine:
                 mod_created_at = modifiers.pop("created_at", None)
                 if mod_created_at is not None and created_at is None:
                     created_at = float(mod_created_at)
+
+            # v1.2 §4.2.2 last row: no meta field present → default to "definitional".
+            # This also catches edges with no modifier block at all (e.g., bare [A] -> [B]).
+            if rule is None:
+                rule = "definitional"
 
                 # Auto-parse timestamp modifier into created_at
                 timestamp_str = modifiers.get("timestamp")
@@ -1158,8 +1209,10 @@ class STGEngine:
             tgt_ns, tgt_name = self._parse_anchor_name(target_raw)
 
             # Extract modifiers
+            # v1.2 (Protocol §4.2): confidence defaults to 1.0; rule inferred
+            # from meta-semantic field when absent.
             modifiers = {}
-            confidence = 0.5
+            confidence = 1.0
             strength = 0.5
             rule = None
             time_val = None
@@ -1170,9 +1223,13 @@ class STGEngine:
             if mod_match:
                 mod_text = mod_match.group(1)
                 modifiers = self._parse_modifier_text(mod_text)
-                confidence = float(modifiers.pop("confidence", 0.5))
-                strength = float(modifiers.pop("strength", 0.5))
+                confidence = float(modifiers.pop("confidence", 1.0))
+                strength_raw = modifiers.pop("strength", None)
+                strength = float(strength_raw) if strength_raw is not None else 0.5
                 rule = modifiers.pop("rule", None)
+                # v1.2 §4.2.2 — infer rule from meta-semantic field if absent
+                if rule is None:
+                    rule = _infer_rule_from_meta(modifiers, has_strength=strength_raw is not None)
                 time_val = modifiers.pop("time", None)
                 # Preserve user-provided `source` (provenance per STL Protocol);
                 # other names popped to avoid collision with add_edge() params.
@@ -1194,6 +1251,11 @@ class STGEngine:
                         edge_created_at = _parse_dt(timestamp_str).timestamp()
                     except (ValueError, ImportError):
                         pass
+
+            # v1.2 §4.2.2 last row: no meta field → default to "definitional".
+            # Also catches edges with no modifier block at all.
+            if rule is None:
+                rule = "definitional"
 
             # STL Protocol §9.4: see ingest_stl for the rationale.
             if self._try_materialize_intrinsic_properties(
@@ -2791,7 +2853,12 @@ class STGEngine:
         lines = []
         for edge in self._edges:
             mods = {}
-            if edge.confidence != 0.5:
+            # v1.2 Protocol §4.2.1: skip default values during serialization so
+            # round-trip preserves the default-omitted form. confidence default
+            # is 1.0 (assertive); strength default 0.5 is engine-internal
+            # (Protocol marks strength absent on non-causal edges, but the
+            # engine stores 0.5 as the legacy fallback).
+            if edge.confidence != 1.0:
                 mods["confidence"] = edge.confidence
             if edge.strength != 0.5:
                 mods["strength"] = edge.strength
@@ -2813,7 +2880,8 @@ class STGEngine:
         lines = []
         for edge in self._edges:
             mod_parts = []
-            if edge.confidence != 0.5:
+            # v1.2 default-omitted serialization — see _export_stl above.
+            if edge.confidence != 1.0:
                 mod_parts.append(f"confidence={edge.confidence}")
             if edge.strength != 0.5:
                 mod_parts.append(f"strength={edge.strength}")

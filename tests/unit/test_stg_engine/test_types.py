@@ -56,7 +56,8 @@ class TestSTGEdge:
         edge = STGEdge(source="A", target="B")
         assert edge.source == "A"
         assert edge.target == "B"
-        assert edge.confidence == 0.5
+        # v1.2 Protocol §4.2.1 — confidence defaults to 1.0 (assertive analytic)
+        assert edge.confidence == 1.0
         assert edge.strength == 0.5
 
     def test_uncertainty(self):
