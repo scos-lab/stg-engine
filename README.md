@@ -302,6 +302,9 @@ v1 endpoints (read-only — mutation stays on `stg` CLI):
 | `POST /v1/propagate` | Activation propagation, `read_only=True` (no Hebbian/telemetry side-effects) |
 | `GET /v1/node/{name}` | Single-node detail with incoming/outgoing edges |
 | `GET /v1/query` | Fuzzy substring search + namespace filter |
+| `GET /v1/paths` | Simple paths between two anchors ("how are A and B related") |
+| `GET /v1/attrs` | Metadata key universe + coverage (scope: node / namespace / graph) |
+| `GET /v1/browse` | Generic reverse-hub intersection/union with weighted ranking |
 
 Interactive API docs at `http://127.0.0.1:8765/docs` (FastAPI auto-OpenAPI).
 
@@ -311,6 +314,9 @@ Example:
 curl -X POST http://127.0.0.1:8765/v1/propagate \
      -H "Content-Type: application/json" \
      -d '{"query": "Elden Ring", "max_nodes": 5}'
+
+# Browse the catalogue: games tagged BOTH FPS and Co_op, ranked by relevance
+curl 'http://127.0.0.1:8765/v1/browse?targets=FPS,Co_op&mode=intersection&namespace=Game&limit=10'
 ```
 
 **Design philosophy:** the HTTP server is JSON substrate. Anonymous
@@ -318,8 +324,7 @@ external traffic flows through `propagate(read_only=True)` so it
 doesn't shape the agent's autonomous learning signal — agents learn
 from their own CLI propagations, not from third-party HTTP reads.
 
-Two more endpoints (`/v1/attrs/{name}`, `/v1/paths`) are pending in M4.
-Full design and decisions:
+All M1–M4 endpoints shipped. Full design and decisions:
 `Semantic-Kernel-of-Consciousness/development/design/STG_HTTP_SERVER_DESIGN.md`.
 
 ---

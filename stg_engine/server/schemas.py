@@ -152,3 +152,74 @@ class QueryResponse(BaseModel):
     matches: List[MatchOut]
     total_matched: int = Field(description="Total matches BEFORE limit truncation.")
     truncated: bool
+
+
+# ─── /v1/paths (M4) ──────────────────────────────────────────────────────────
+
+
+class PathsResponse(BaseModel):
+    """All simple paths between two nodes, shortest first."""
+
+    agent: str
+    source: str
+    target: str
+    max_depth: int
+    paths: List[List[str]] = Field(
+        default_factory=list,
+        description="Each path is a list of display node names from source to target.",
+    )
+    path_count: int = Field(description="Total paths found BEFORE limit truncation.")
+    truncated: bool = False
+
+
+# ─── /v1/attrs (M4) ──────────────────────────────────────────────────────────
+
+
+class AttrKeyOut(BaseModel):
+    """One metadata key and its coverage within the queried scope."""
+
+    key: str
+    count: int = Field(description="In-scope nodes carrying this key.")
+    total: int = Field(description="Total in-scope nodes.")
+
+
+class AttrsResponse(BaseModel):
+    """Metadata key universe for a node / namespace / whole graph.
+
+    Schema-less metadata means clients must discover which attributes exist
+    before they can filter on them. This is that discovery endpoint.
+    """
+
+    agent: str
+    scope: str = Field(description="'node:<name>' | 'namespace:<ns>' | 'graph'.")
+    keys: List[AttrKeyOut] = Field(default_factory=list)
+
+
+# ─── /v1/browse (M4) — reverse-hub intersection/union ─────────────────────────
+
+
+class BrowseItemOut(BaseModel):
+    """One node in a browse result, with relevance score against the targets."""
+
+    name: str
+    namespace: Optional[str] = None
+    score: float = Field(
+        description="Sum of edge weights (modifier 'weight', else 1.0) to matched targets.",
+    )
+    matched: int = Field(description="How many of the requested targets this node links to.")
+
+
+class BrowseResponse(BaseModel):
+    """Catalog browse: nodes linking to a set of target anchors.
+
+    Generic reverse-hub. stg-steam's 'browse games by tags' is this endpoint
+    with namespace='Game' and targets=['Tag:FPS', 'Tag:Co-op', ...].
+    """
+
+    agent: str
+    targets: List[str]
+    mode: str = Field(description="'intersection' (link ALL targets) or 'union' (link ANY).")
+    namespace_filter: Optional[str] = None
+    items: List[BrowseItemOut] = Field(default_factory=list)
+    total_matched: int = Field(description="Matching nodes BEFORE limit truncation.")
+    truncated: bool = False

@@ -83,8 +83,9 @@ v1 surface (read-only — mutation stays on `stg` CLI):
 | `POST /v1/propagate` | shipped (commit `13a42e2`) | Activation propagation (read_only=True under the hood) |
 | `GET /v1/node/{name}` | shipped (commit `13a42e2`) | Single-node detail with incoming/outgoing edges |
 | `GET /v1/query` | shipped (commit `13a42e2`) | Fuzzy substring search + namespace filter |
-| `GET /v1/attrs/{name}` | M4 pending | Node metadata projection |
-| `GET /v1/paths` | M4 pending | Topology query between two anchors |
+| `GET /v1/paths` | shipped (M4) | Simple paths between two anchors ("how are A and B related") |
+| `GET /v1/attrs` | shipped (M4) | Metadata key universe + coverage (scope: node / namespace / graph) |
+| `GET /v1/browse` | shipped (M4) | Generic reverse-hub intersection/union with weighted ranking |
 
 Key design points:
 - **`engine.propagate(read_only=True)`** (commit `fd18059`) — HTTP path
@@ -109,8 +110,24 @@ not in `.stg`, modifiers stringified on wire, conditional CORS, static
 `.stg` with `engine_mtime` surface for clients, Pydantic v2 hard
 requirement.
 
-27 new integration tests across `tests/integration/test_server_v1_*.py`.
-E2E verified against `~/.stg/stg-steam-g8-verify` (84 nodes / 137 edges).
+40 integration tests across `tests/integration/test_server_v1_*.py`
+(27 M1–M3 + 13 M4). E2E verified against `~/.stg/stg-steam-g8-verify`
+(84 nodes / 137 edges) and the full `~/.stg/stg-steam-full` graph
+(136,977 nodes / 2.27M edges): `/v1/attrs?namespace=Game` → 61 keys,
+`/v1/browse?targets=FPS,Co_op&mode=intersection&namespace=Game` → 798
+games ranked by SteamSpy vote weight.
+
+M4 design notes:
+- **`/v1/browse` is generic, not `/v1/games`** — the engine serves
+  arbitrary agents (reddit-radar has no "games"). stg-steam's "browse
+  games by tag" is the `namespace=Game` special case. Ranking sums the
+  `weight` edge modifier (SteamSpy votes) where present, else 1.0.
+- **`/v1/attrs` is key *discovery*, not value projection** — per-node
+  attribute values already come back in `/v1/node/{name}` metadata. This
+  endpoint answers "which attributes exist in this scope?" against
+  schema-less metadata.
+- **`/v1/paths` caps `max_depth` at 8** — guards against combinatorial
+  blowup of `all_simple_paths` on the dense full graph.
 
 ### Added — `stg attrs --key` projection + `--keys` tips
 
