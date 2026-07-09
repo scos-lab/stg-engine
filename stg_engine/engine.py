@@ -203,6 +203,56 @@ except ImportError:
     from stg_engine import _core_fallback as _rust
 
 
+# ─── Propagate seed-matching helpers (F5 inverted index) ─────────
+# Precompiled once at import (previously rebuilt per-call and per-node).
+_HAS_CJK = re.compile(r'[一-鿿㐀-䶿]')
+_RE_NAME_SEP = re.compile(r'[_:\-]')
+_RE_LATIN_WORD = re.compile(r'[a-z]+|[A-Z][a-z]*|\d+')
+_RE_CJK_RUN = re.compile(r'[一-鿿㐀-䶿]+')
+
+# Known English morphological endings — a token may match a node word by prefix
+# only when the trailing difference is one of these (prevents "attic"->"atticus"
+# while preserving "mad"->"madness").
+_MORPH_SUFFIXES = (
+    "s", "es", "ed", "ing", "er", "est", "ly",
+    "ness", "ment", "tion", "sion", "ation",
+    "ous", "ious", "ful", "less", "able", "ible",
+    "ive", "al", "ial", "ical", "ity", "ty",
+    "ence", "ance", "dom", "ship", "ism", "ist",
+    "ize", "ise", "ify", "en",
+)
+
+
+def _is_morph_prefix(shorter: str, longer: str) -> bool:
+    """True if `shorter` is a morphological prefix of `longer`."""
+    if not longer.startswith(shorter):
+        return False
+    suffix = longer[len(shorter):]
+    if not suffix:
+        return True  # exact match
+    # Short stems (<=3 chars) are too ambiguous for prefix matching
+    # (e.g. "mr" -> "mrs", "set" -> "setting").
+    if len(shorter) <= 3:
+        return False
+    return suffix in _MORPH_SUFFIXES
+
+
+def _name_words(name: str) -> FrozenSet[str]:
+    """Matchable words in a node name: latin/digit runs (len>=2) plus CJK
+    full-runs and individual CJK chars. Single source of truth shared by the
+    propagate seed matcher and the inverted index, so the two never drift."""
+    lower = name.lower()
+    words = set()
+    for part in _RE_NAME_SEP.split(lower):
+        for w in _RE_LATIN_WORD.findall(part):
+            if len(w) >= 2:
+                words.add(w)
+        for cjk in _RE_CJK_RUN.findall(part):
+            words.add(cjk)       # full run, e.g. "贾宝玉"
+            words.update(cjk)    # individual chars 贾, 宝, 玉
+    return frozenset(words)
+
+
 class STGEngine:
     """Self-contained computation graph for Semantic Tension.
 
@@ -284,6 +334,13 @@ class STGEngine:
         self._inhibition_config: InhibitionConfig = InhibitionConfig()
         self._refractory_set: Dict[str, float] = {}  # node → prior activation
 
+        # Inverted word index for propagate seed matching (F5) — lazy,
+        # per-process; invalidated on graph mutation via _invalidate_caches.
+        self._word_index: Optional[Dict[str, set]] = None       # word → {nk}
+        self._word_first_char: Optional[Dict[str, set]] = None  # first char → {word}
+        self._cjk_name_nodes: Optional[set] = None              # {nk : name has CJK}
+        self._node_words: Optional[Dict[str, FrozenSet[str]]] = None  # nk → _name_words(nk)
+
     # ═══════════════════════════════════════════════════════════
     # Inhibition Configuration (Phase 9)
     # ═══════════════════════════════════════════════════════════
@@ -320,6 +377,80 @@ class STGEngine:
         self._importance_cache = None
         self._graph_metrics_cache = None
         self._gravity_map = None
+        # F5 inverted word index (rebuilt lazily on next propagate).
+        self._word_index = None
+        self._word_first_char = None
+        self._cjk_name_nodes = None
+        self._node_words = None
+
+    def _ensure_word_index(self) -> None:
+        """Lazily build the inverted word index for propagate seed matching.
+
+        Maps word -> {node keys containing it}, plus a first-char bucket of
+        words and the set of nodes whose name contains CJK, plus a per-node
+        cache of _name_words(). Built once per process; set to None on any graph
+        mutation via _invalidate_caches, so it rebuilds on the next propagate.
+        """
+        if self._word_index is not None:
+            return
+        wi: Dict[str, set] = {}
+        fc: Dict[str, set] = {}
+        cjk_nodes: set = set()
+        node_words: Dict[str, FrozenSet[str]] = {}
+        for nk in self._nodes:
+            words = _name_words(nk)
+            node_words[nk] = words
+            for w in words:
+                bucket = wi.get(w)
+                if bucket is None:
+                    wi[w] = bucket = set()
+                bucket.add(nk)
+                first = w[0]
+                fcb = fc.get(first)
+                if fcb is None:
+                    fc[first] = fcb = set()
+                fcb.add(w)
+            if _HAS_CJK.search(nk):
+                cjk_nodes.add(nk)
+        # Publish the sentinel (_word_index) LAST so a concurrent reader (e.g.
+        # the multi-threaded HTTP server sharing one engine) never sees the
+        # "index is built" guard pass while the companion fields are still None.
+        self._word_first_char = fc
+        self._cjk_name_nodes = cjk_nodes
+        self._node_words = node_words
+        self._word_index = wi
+
+    def _seed_candidates(self, long_tokens: List[str], short_tokens: List[str]):
+        """Superset of node keys that could match, to prune the seed scan.
+
+        Returns None to mean 'scan every node' — short tokens substring-match
+        against the full name, which the word index cannot narrow. Otherwise
+        the returned set is a proven superset of the full-scan matches:
+          * exact word match      -> _word_index[token]
+          * morphological prefix (either direction) shares the token's first
+            character -> scan only that first-char word bucket
+          * CJK substring fallback -> only nodes whose name contains CJK
+        The per-node matching below re-checks each candidate with the exact
+        original logic, so false candidates are harmlessly filtered out.
+        """
+        if short_tokens:
+            return None
+        wi = self._word_index
+        fc = self._word_first_char
+        cjk_nodes = self._cjk_name_nodes
+        cand: set = set()
+        for t in long_tokens:
+            exact = wi.get(t)
+            if exact:
+                cand |= exact
+            for w in fc.get(t[0], ()):
+                if w != t and (_is_morph_prefix(t, w) or _is_morph_prefix(w, t)):
+                    cand |= wi[w]
+            if _HAS_CJK.search(t):
+                for nk in cjk_nodes:
+                    if t in nk:
+                        cand.add(nk)
+        return cand
 
     # ═══════════════════════════════════════════════════════════
     # Case-insensitive node key normalization
@@ -1674,7 +1805,20 @@ class STGEngine:
         short_tokens = [t for t in tokens if len(t) < 2]
         # Track (node_name, hit_count, matched_tokens) for IDF scoring
         matching_hits: List[Tuple[str, int, List[str]]] = []
+
+        # F5 inverted index: restrict the scan to a candidate superset so the
+        # expensive per-node morphology check runs only on nodes that can match.
+        # We still iterate self._nodes in order and merely filter, so
+        # matching_hits is built in the identical order to a full scan — keeping
+        # seed-cap tie-breaking (hence the selected seed set) unchanged.
+        # candidates=None => scan every node (short-token substring case).
+        self._ensure_word_index()
+        candidates = self._seed_candidates(long_tokens, short_tokens)
+        node_words = self._node_words
+
         for name in self._nodes:
+            if candidates is not None and name not in candidates:
+                continue
             name_lower = name.lower()
             hit_count = 0
             # Short token: substring match (backward compat for single-char nodes)
@@ -1685,44 +1829,7 @@ class STGEngine:
                     continue
             # Long token: word boundary match with hit counting
             if long_tokens:
-                name_parts = re.split(r'[_:\-]', name_lower)
-                words = []
-                for p in name_parts:
-                    # Latin/digit words
-                    words.extend(
-                        w.lower() for w in re.findall(r'[a-z]+|[A-Z][a-z]*|\d+', p)
-                        if len(w) >= 2
-                    )
-                    # CJK characters: each char is a word, also keep full string
-                    cjk_chars = re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]+', p)
-                    for cjk in cjk_chars:
-                        words.append(cjk)  # full string (e.g. "贾宝玉")
-                        words.extend(cjk)  # individual chars (e.g. "贾","宝","玉")
-                # Morphological prefix matching: only allow prefix match when
-                # the suffix is a known English morphological ending.
-                # This prevents false matches like "attic" → "atticus"
-                # while preserving valid ones like "mad" → "madness".
-                _morph_suffixes = (
-                    "s", "es", "ed", "ing", "er", "est", "ly",
-                    "ness", "ment", "tion", "sion", "ation",
-                    "ous", "ious", "ful", "less", "able", "ible",
-                    "ive", "al", "ial", "ical", "ity", "ty",
-                    "ence", "ance", "dom", "ship", "ism", "ist",
-                    "ize", "ise", "ify", "en",
-                )
-
-                def _is_morph_prefix(shorter: str, longer: str) -> bool:
-                    """Check if shorter is a morphological prefix of longer."""
-                    if not longer.startswith(shorter):
-                        return False
-                    suffix = longer[len(shorter):]
-                    if not suffix:
-                        return True  # exact match
-                    # Short stems (<=3 chars) are too ambiguous for prefix
-                    # matching (e.g. "mr" → "mrs", "set" → "setting")
-                    if len(shorter) <= 3:
-                        return False
-                    return suffix in _morph_suffixes
+                words = node_words[name]
 
                 # Per-token matching with IDF tracking
                 matched_tokens = []
