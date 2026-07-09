@@ -328,6 +328,16 @@ class STGEngine:
         self._gravity_persist = None  # (blob, n_nodes, n_edges, built_at) to persist on save;
         #   captured at build time so it survives Hebbian's salience-only invalidation
 
+        # ── F3 (review 2026-07-08): lazy-subsystem registry — assessed, DEFERRED ──
+        # The lazy subsystem handles below (_learner / _cognitive / _feedback /
+        # _telemetry / _conflict_detector / embedding trio) were flagged for
+        # collapsing into a `self._subsystems` dict + unified lazy getter. Kept
+        # flat deliberately: these handles have ~119 access sites (69 here + ~50
+        # across other modules and tests), so a registry means either a ~119-site
+        # rename (high churn/risk) or ~9 property-forwarding shims that add an
+        # indirection layer (less readable, not more). Surface >> benefit (pure
+        # __init__ cosmetics), so — per the review's own guidance — documented
+        # rather than churned. Revisit if this init crosses ~25 handles.
         # Learning (Phase 7B)
         self._learner = None  # Optional[HebbianLearner]
         self._learning_log: List = []  # List[LearningEvent]
