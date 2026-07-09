@@ -1903,7 +1903,12 @@ class STGEngine:
             (name, act) for name, act in activation_map.items()
             if act > effective_threshold
         ]
-        activated.sort(key=lambda x: x[1], reverse=True)
+        # Deterministic order: activation descending, then node key ascending as
+        # a stable tie-break. Without the name tie-break, equal-activation nodes
+        # inherit the Rust core's HashMap iteration order, which is randomized
+        # per call — making recall output non-reproducible across (and even
+        # within) processes. The result SET is unaffected; only tie order.
+        activated.sort(key=lambda x: (-x[1], x[0]))
 
         # Compute and store propagation metrics (Phase 7A)
         from stg_engine.metrics import (
