@@ -258,6 +258,95 @@ def _audit_log(cmd, args, before, after=None, detail=""):
     _audit.info(msg)
 
 
+# ═══════════════════════════════════════════════════════════
+# Write-lock support (F1/F4) — see interlock.py for the full rationale.
+# ═══════════════════════════════════════════════════════════
+from stg_engine import interlock
+
+_LOCK_TIMEOUT_S = 15.0
+
+# Commands whose handler performs a whole-graph engine.save (the F1/F4 lost-
+# update target) hold an exclusive interprocess lock for their whole run.
+# 'feedback' is included because it writes the .stg incrementally
+# (active_context) even without an engine.save. EVERY other command — reads,
+# plus incremental-only or long-running writers such as use / simulate / embed /
+# perceive — takes NO lock: reads are consistent via SQLite + save's atomic
+# rename, and locking a long command would starve real writers.
+_LOCK_WRITE_CMDS = frozenset({
+    "import-doc", "propagate", "select", "ingest", "bind", "alias",
+    "ingest-file", "merge", "consolidate", "xref", "virtual", "learn",
+    "prune", "topology", "cognitive", "reload", "import", "preference",
+    "coactivation", "temporal", "feedback",
+})
+
+# Optimistic-concurrency baseline captured at load; guards against a
+# non-cooperating writer that bypassed the lock (see _cli_save).
+_load_baseline = {"mtime_ns": None, "nodes": None, "edges": None}
+
+
+def _mtime_ns(path):
+    try:
+        return os.stat(path).st_mtime_ns
+    except OSError:
+        return None
+
+
+def _note_loaded_baseline(engine):
+    """Record the on-disk state we loaded from, for the _cli_save guard."""
+    _load_baseline["mtime_ns"] = _mtime_ns(STG_PATH)
+    _load_baseline["nodes"] = len(engine._nodes)
+    _load_baseline["edges"] = len(engine._edges)
+
+
+def _disk_graph_counts(path):
+    """(node_count, edge_count) straight from the .stg, or (None, None)."""
+    import sqlite3
+    try:
+        conn = sqlite3.connect(path)
+        try:
+            n = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+            e = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+            return n, e
+        finally:
+            conn.close()
+    except Exception:
+        return None, None
+
+
+def _cli_save(engine):
+    """CLI-layer save: optimistic external-modification guard, then save.
+
+    The exclusive interprocess lock already serializes cooperating `stg`
+    writers. This adds a belt-and-braces guard against a NON-cooperating writer
+    (one that bypassed the lock) that rewrote the whole graph between our load
+    and our save. It distinguishes our own incremental side-writes
+    (telemetry.flush / active_context — which bump the file mtime but not the
+    node/edge counts) from a real external graph rewrite via a cheap count
+    check, so it never false-positives on e.g. propagate's own telemetry flush.
+    """
+    base_mtime = _load_baseline["mtime_ns"]
+    if base_mtime is not None:
+        cur_mtime = _mtime_ns(STG_PATH)
+        if cur_mtime is not None and cur_mtime != base_mtime:
+            dn, de = _disk_graph_counts(STG_PATH)
+            if dn is not None and (dn, de) != (
+                _load_baseline["nodes"], _load_baseline["edges"]
+            ):
+                print(
+                    f"error: {STG_PATH} changed on disk since it was loaded "
+                    f"(nodes/edges {(_load_baseline['nodes'], _load_baseline['edges'])}"
+                    f" -> {(dn, de)}).\nRefusing to save to avoid clobbering "
+                    f"another writer's changes. Re-run to pick up the new state.",
+                    file=sys.stderr,
+                )
+                sys.exit(3)
+    engine.save(STG_PATH)
+    # Advance the baseline past our own write.
+    _load_baseline["mtime_ns"] = _mtime_ns(STG_PATH)
+    _load_baseline["nodes"] = len(engine._nodes)
+    _load_baseline["edges"] = len(engine._edges)
+
+
 def load_engine():
     from stg_engine import STGEngine
     if os.path.exists(STG_PATH):
@@ -265,7 +354,7 @@ def load_engine():
     # First use: create empty graph and parent directories
     os.makedirs(os.path.dirname(STG_PATH), exist_ok=True)
     engine = STGEngine()
-    engine.save(STG_PATH)
+    _cli_save(engine)
     print(f"Created new STG: {STG_PATH}")
     return engine
 
@@ -355,7 +444,7 @@ def cmd_import_doc(engine, filepath, source_type="doc", max_desc=10000):
         source_type=source_type,
         timestamp=ts,
     )
-    engine.save(STG_PATH)
+    _cli_save(engine)
     print(f"Imported: [{node_name}] -> [{content_node}] ({len(text)} chars)")
     s = engine.get_stats()
     print(f"Graph: {s['node_count']} nodes, {s['edge_count']} edges")
@@ -1221,7 +1310,7 @@ def cmd_propagate(engine, text, use_gravity=False, resolution="medium", all_chai
     # Flush telemetry + save
     if engine._telemetry:
         engine._telemetry.flush(STG_PATH)
-    engine.save(STG_PATH)
+    _cli_save(engine)
 
     # Log to propagate_log.stl.md
     _log_propagate(engine, text, elapsed)
@@ -1284,7 +1373,7 @@ def cmd_select(engine, args):
 
     # Save engine first (salience changes), then active context
     # Order matters: engine.save() may recreate tables
-    engine.save(STG_PATH)
+    _cli_save(engine)
     save_active_context(engine, result.selected_nodes, STG_PATH)
 
     print(f"Selected {len(result.selected_nodes)} node(s):")
@@ -2122,7 +2211,7 @@ def cmd_ingest(engine, stl_text, edge_class="knowledge", no_link=False):
             print(f"  → To register alias: stg alias add <new_name> {display_name}")
         engine._last_entity_candidates = None
 
-    engine.save(STG_PATH)
+    _cli_save(engine)
     print(f"Ingested {count} edge(s) (edge_class={edge_class}). Saved to memory.stg.")
     s = engine.get_stats()
     print(f"Graph: {s['node_count']} nodes, {s['edge_count']} edges")
@@ -2170,7 +2259,7 @@ def cmd_ingest(engine, stl_text, edge_class="knowledge", no_link=False):
                             virtual_reason="auto_bind",
                         )
                         bound += 1
-            engine.save(STG_PATH)
+            _cli_save(engine)
             print(f"\nAuto-bind: community={comm_id} (anchor: {anchor})")
             print(f"  Bound {len(new_nodes)} new node(s) to {len(same_comm)} candidate(s) ({bound} virtual edge(s)):")
             for name in same_comm:
@@ -2237,7 +2326,7 @@ def cmd_bind(engine, args):
                 )
                 bound += 1
 
-    engine.save(STG_PATH)
+    _cli_save(engine)
     print(f"Bound {len(new_nodes)} new node(s) to {len(selected)} candidate(s) ({bound} virtual edge(s)):")
     for name in selected:
         print(f"  → {name}")
@@ -2256,7 +2345,7 @@ def cmd_alias(engine, subcmd, args):
         alias_name, canonical_name = args[0], args[1]
         ok = engine.register_alias(alias_name, canonical_name)
         if ok:
-            engine.save(STG_PATH)
+            _cli_save(engine)
             resolved = engine.resolve_name(alias_name)
             print(f"Alias registered: \"{alias_name}\" → \"{resolved}\"")
         else:
@@ -2272,7 +2361,7 @@ def cmd_alias(engine, subcmd, args):
     elif subcmd == "remove" and len(args) >= 1:
         ok = engine.remove_alias(args[0])
         if ok:
-            engine.save(STG_PATH)
+            _cli_save(engine)
             print(f"Alias removed: \"{args[0]}\"")
         else:
             print(f"Alias \"{args[0]}\" not found.")
@@ -2309,7 +2398,7 @@ def cmd_ingest_file(engine, file_path, created_at=None):
         print(f"File not found: {file_path}")
         return
     count = engine.ingest_stl_file(file_path, created_at=created_at)
-    engine.save(STG_PATH)
+    _cli_save(engine)
     print(f"Ingested {count} edge(s) from {os.path.basename(file_path)}. Saved to memory.stg.")
     s = engine.get_stats()
     print(f"Graph: {s['node_count']} nodes, {s['edge_count']} edges")
@@ -2367,7 +2456,7 @@ def cmd_merge(engine, stl_text):
             confidence=conf, strength=strength, rule=rule,
             **patch,
         )
-        engine.save(STG_PATH)
+        _cli_save(engine)
         fields_added = len(patch) + (1 if conf is not None else 0) + (1 if rule is not None else 0)
         print(f"Merged [{source}] -> [{target}]: {fields_added} field(s) patched")
     except KeyError:
@@ -2412,7 +2501,7 @@ def cmd_consolidate(engine, args):
                 total_errors += 1
                 print(f"  [{src}] -> [{tgt}]: SKIP ({e})")
 
-        engine.save(STG_PATH)
+        _cli_save(engine)
         s = engine.get_stats()
         print(f"\nConsolidated {total_merged} pair(s) ({total_errors} skipped)")
         print(f"Graph: {s['node_count']} nodes, {s['edge_count']} edges")
@@ -2424,7 +2513,7 @@ def cmd_consolidate(engine, args):
             if result is None:
                 print(f"[{source}] -> [{target}]: only 0-1 edges, nothing to consolidate.")
             else:
-                engine.save(STG_PATH)
+                _cli_save(engine)
                 print(f"Consolidated [{source}] -> [{target}]: {result.edges_merged} edges → 1")
                 s = engine.get_stats()
                 print(f"Graph: {s['node_count']} nodes, {s['edge_count']} edges")
@@ -2483,7 +2572,7 @@ def cmd_xref(engine, args):
                 print(f"    {marker} [{r.source}] → [{r.target}] (token: \"{r.matched_token}\", IDF: {r.idf_score:.2f})")
 
     if not dry_run and report.edges_created > 0:
-        engine.save(STG_PATH)
+        _cli_save(engine)
         s = engine.get_stats()
         print(f"\nGraph: {s['node_count']} nodes, {s['edge_count']} edges")
 
@@ -2684,13 +2773,13 @@ def _virtual_list(engine):
 
 def _virtual_clear(engine):
     count = engine.clear_virtual_edges()
-    engine.save(STG_PATH)
+    _cli_save(engine)
     print(f"Cleared {count} virtual edge(s). Saved.")
 
 
 def _virtual_rebuild(engine):
     count = engine.rebuild_virtual_edges()
-    engine.save(STG_PATH)
+    _cli_save(engine)
     print(f"Rebuilt {count} virtual edge(s). Saved.")
     vs = engine.get_virtual_edge_stats()
     if vs['reason_distribution']:
@@ -2769,7 +2858,7 @@ def cmd_learn(engine, subcmd, args):
         t0 = time.perf_counter()
         events = engine.learn_from_path(path)
         elapsed = time.perf_counter() - t0
-        engine.save(STG_PATH)
+        _cli_save(engine)
         if events:
             print(f"Strengthened {len(events)} edge(s) ({elapsed*1000:.1f}ms):")
             for ev in events:
@@ -2810,7 +2899,7 @@ def cmd_learn(engine, subcmd, args):
             print(f"\nQE={pm.query_efficiency:.3f}  RS={pm.resonance_score:.3f}  "
                   f"coverage={pm.coverage:.4f}")
 
-        engine.save(STG_PATH)
+        _cli_save(engine)
         print("Saved.")
     else:
         print("Usage: learn status | learn path <n1> <n2> ... | learn propagate <text>")
@@ -2846,7 +2935,7 @@ def cmd_prune(engine, dry_run=False, conf=0.1, days=30.0):
             if len(pruned_edges) > 10:
                 print(f"  ... and {len(pruned_edges) - 10} more")
         if events:
-            engine.save(STG_PATH)
+            _cli_save(engine)
             s = engine.get_stats()
             print(f"Graph: {s['node_count']} nodes, {s['edge_count']} edges. Saved.")
         else:
@@ -3203,7 +3292,7 @@ def cmd_topology(engine, subcmd, args):
             print(f"Redundant removed: {report.redundant_count}")
         print(f"Before: {report.node_count} nodes, {report.edge_count} edges")
 
-        engine.save(STG_PATH)
+        _cli_save(engine)
         s = engine.get_stats()
         print(f"After:  {s['node_count']} nodes, {s['edge_count']} edges. Saved.")
 
@@ -3285,7 +3374,7 @@ def cmd_cognitive(engine, subcmd, args):
             gen = HypothesisGenerator()
             created = gen.apply_hypotheses(engine, hypotheses)
             print(f"\nApplied: {created} edges created")
-            engine.save(STG_PATH)
+            _cli_save(engine)
             print("Saved to .stg")
         elif hypotheses and not apply_flag:
             print("\nUse --apply to commit as edges.")
@@ -3625,7 +3714,7 @@ def cmd_reload():
     engine = import_memory_matrix(MATRIX_PATH)
     engine.compute_all_tensions()
     engine.compute_activations()
-    engine.save(STG_PATH)
+    _cli_save(engine)
     s = engine.get_stats()
     print(f"Reloaded from memoryMatrix.md → memory.stg")
     print(f"Graph: {s['node_count']} nodes, {s['edge_count']} edges")
@@ -3645,7 +3734,7 @@ def cmd_import(manifest_path=None):
     engine = import_knowledge_base(manifest, project_root=project_root)
     elapsed = time.perf_counter() - t0
 
-    engine.save(STG_PATH)
+    _cli_save(engine)
     s = engine.get_stats()
 
     print(f"Knowledge base imported → memory.stg ({elapsed:.1f}s)")
@@ -3715,12 +3804,12 @@ def cmd_preference(engine, subcmd, args):
                 path.append(args[i])
                 i += 1
         updated = pf.reward_path(engine, path, reward=reward)
-        engine.save(STG_PATH)
+        _cli_save(engine)
         print(f"Rewarded {updated} edge(s) along path: {' -> '.join(path)}")
 
     elif subcmd == "decay":
         affected = pf.decay_preferences(engine)
-        engine.save(STG_PATH)
+        _cli_save(engine)
         print(f"Decayed {affected} edge(s) with non-zero preference.")
 
     else:
@@ -3768,7 +3857,7 @@ def cmd_coactivation(engine, subcmd, args):
             edges_created=len(events),
             candidates_detail=candidates,
         )
-        engine.save(STG_PATH)
+        _cli_save(engine)
         print(f"Created {len(events)} co-activation edge(s). Saved.")
         for ev in events:
             print(f"  {ev.source} → {ev.target} (conf={ev.new_confidence:.2f})")
@@ -3931,7 +4020,7 @@ def cmd_temporal(engine, subcmd, args):
         for e in edges:
             print(f"  [{e.source}] →(k={e.delay_k}) [{e.target}]")
         if edges:
-            engine.save(STG_PATH)
+            _cli_save(engine)
             print("Saved.")
 
     elif subcmd == "stats":
@@ -4452,6 +4541,14 @@ def main():
 
     cmd = sys.argv[1]
 
+    # Interprocess write lock (F1/F4): whole-graph writers serialize on
+    # <stg>.lock, held from here to process exit so it spans load->mutate->save.
+    # Reads and incremental-only / long-running commands take no lock. This
+    # covers the early-return write commands (reload/import) below as well as
+    # the main dispatch. See interlock.py.
+    if cmd in _LOCK_WRITE_CMDS:
+        interlock.hold_stg_lock(STG_PATH, timeout=_LOCK_TIMEOUT_S)
+
     if cmd == "reload":
         _audit.info(f"CMD=reload | args={sys.argv[2:]} | FULL RELOAD (pre-engine)")
         cmd_reload()
@@ -4471,6 +4568,7 @@ def main():
     t0 = time.perf_counter()
     engine = load_engine()
     load_ms = (time.perf_counter() - t0) * 1000
+    _note_loaded_baseline(engine)  # optimistic-concurrency baseline (see _cli_save)
 
     # --- Audit: snapshot before ---
     _before = _snap(engine)
