@@ -8,6 +8,7 @@ Formulas execute directly on the graph. Persistence is serialization.
 """
 
 import logging
+import math
 import os
 import re
 import time as _time
@@ -195,6 +196,7 @@ from stg_engine.formulas import (
     compute_intrinsic_reward,
 )
 from stg_engine.persistence import save_engine_state, load_engine_state
+from stg_engine.kanerva import ConflictDetector  # safe: kanerva imports engine only under TYPE_CHECKING
 
 # ─── Hot-path core: optional Rust, pure-Python fallback ──────────
 try:
@@ -251,6 +253,30 @@ def _name_words(name: str) -> FrozenSet[str]:
             words.add(cjk)       # full run, e.g. "贾宝玉"
             words.update(cjk)    # individual chars 贾, 宝, 玉
     return frozenset(words)
+
+# Stop words filtered from propagate input (module-level; was rebuilt per call).
+# Deduped — "its" appeared twice in the original literal.
+_STOP_WORDS = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "be", "been",
+    "am", "do", "does", "did", "has", "have", "had", "it", "its",
+    "what", "who", "how", "why", "when", "where", "which",
+    "to", "of", "in", "on", "at", "by", "for", "with", "from",
+    "and", "or", "not", "no", "if", "but", "so", "as", "than",
+    "me", "my", "we", "us", "you", "he", "she", "they", "them",
+    "this", "that", "these", "those", "about", "tell", "describe",
+    "explain", "can", "could", "would", "should", "will",
+    "first", "last", "second", "third", "next", "new", "old",
+    "set", "sets", "get", "gets", "got", "put", "take", "took",
+    "make", "made", "give", "gave", "come", "came", "go", "went",
+    "one", "two", "three", "also", "just", "even", "still",
+    "most", "more", "much", "many", "some", "any", "all", "each",
+    "very", "own", "same", "other", "such", "only", "back",
+    "after", "before", "between", "through", "over", "under",
+    "into", "out", "up", "down", "off", "then", "now", "here",
+    "there", "way", "well", "part", "like", "being", "both",
+    "may", "might", "must", "shall", "his", "her", "our", "your",
+    "their", "him", "itself", "never", "always", "often",
+})
 
 
 class STGEngine:
@@ -713,7 +739,6 @@ class STGEngine:
         # G6 fix: conflict detection — check for contradictions before writing
         if modifiers.get("edge_class") != "virtual":
             if self._conflict_detector is None:
-                from stg_engine.kanerva import ConflictDetector
                 self._conflict_detector = ConflictDetector()
             # Build full modifier dict including named params for contradiction check
             _check_mods = dict(modifiers)
@@ -1758,28 +1783,6 @@ class STGEngine:
             List of activated node names, sorted by activation descending
         """
         # Tokenize with stop word and short token filtering
-        _stop = {
-            "a", "an", "the", "is", "are", "was", "were", "be", "been",
-            "am", "do", "does", "did", "has", "have", "had", "it", "its",
-            "what", "who", "how", "why", "when", "where", "which",
-            "to", "of", "in", "on", "at", "by", "for", "with", "from",
-            "and", "or", "not", "no", "if", "but", "so", "as", "than",
-            "me", "my", "we", "us", "you", "he", "she", "they", "them",
-            "this", "that", "these", "those", "about", "tell", "describe",
-            "explain", "can", "could", "would", "should", "will",
-            # Common generic words that cause false seed matches
-            "first", "last", "second", "third", "next", "new", "old",
-            "set", "sets", "get", "gets", "got", "put", "take", "took",
-            "make", "made", "give", "gave", "come", "came", "go", "went",
-            "one", "two", "three", "also", "just", "even", "still",
-            "most", "more", "much", "many", "some", "any", "all", "each",
-            "very", "own", "same", "other", "such", "only", "back",
-            "after", "before", "between", "through", "over", "under",
-            "into", "out", "up", "down", "off", "then", "now", "here",
-            "there", "way", "well", "part", "like", "being", "both",
-            "may", "might", "must", "shall", "his", "her", "our", "your",
-            "their", "its", "him", "itself", "never", "always", "often",
-        }
         raw = input_text.lower().split()
         # Split compound tokens (hyphen, underscore) into parts too
         # and strip trailing punctuation from each part
@@ -1796,11 +1799,10 @@ class STGEngine:
                 if seq not in expanded:
                     expanded.append(seq)
         # CJK chars are semantically meaningful at len=1, so only filter len<2 for ASCII
-        _has_cjk = re.compile(r'[\u4e00-\u9fff\u3400-\u4dbf]')
-        tokens = [t for t in expanded if (len(t) >= 2 or _has_cjk.search(t)) and t not in _stop]
+        tokens = [t for t in expanded if (len(t) >= 2 or _HAS_CJK.search(t)) and t not in _STOP_WORDS]
         if not tokens:
             # Fallback 1: non-stop words of any length
-            tokens = [t for t in expanded if t not in _stop]
+            tokens = [t for t in expanded if t not in _STOP_WORDS]
         if not tokens:
             # Fallback 2: all words (for single-char node names in tests)
             tokens = expanded if expanded else raw
@@ -1851,7 +1853,7 @@ class STGEngine:
                 hit_count = len(matched_tokens)
                 # CJK substring match: "宝玉" should match node "贾宝玉"
                 if hit_count == 0:
-                    cjk_tokens = [t for t in long_tokens if _has_cjk.search(t)]
+                    cjk_tokens = [t for t in long_tokens if _HAS_CJK.search(t)]
                     for ct in cjk_tokens:
                         if ct in name_lower:
                             hit_count += 1
@@ -1865,7 +1867,7 @@ class STGEngine:
         for _, _, mtokens in matching_hits:
             for tk in mtokens:
                 _token_df[tk] = _token_df.get(tk, 0) + 1
-        _log = __import__("math").log
+        _log = math.log
         _token_idf = {tk: _log(_N / (1 + df)) for tk, df in _token_df.items()}
 
         # IDF-weighted hit score: sum of IDF weights of matched tokens
