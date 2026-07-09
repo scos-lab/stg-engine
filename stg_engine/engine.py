@@ -297,7 +297,10 @@ class STGEngine:
         self._last_propagation_metrics: Optional[PropagationMetrics] = None
         self._importance_cache: Optional[Dict[str, float]] = None
         self._graph_metrics_cache: Optional[GraphMetrics] = None
-        self._gravity_map = None  # Optional[GravityMap] — cached, invalidated on mutation
+        self._gravity_map = None  # Optional[GravityMap] — live cache, cleared on mutation
+        self._gravity_cache_pending = None  # (blob, n_nodes, n_edges, built_at) loaded from disk (F6)
+        self._gravity_persist = None  # (blob, n_nodes, n_edges, built_at) to persist on save;
+        #   captured at build time so it survives Hebbian's salience-only invalidation
 
         # Learning (Phase 7B)
         self._learner = None  # Optional[HebbianLearner]
@@ -377,6 +380,12 @@ class STGEngine:
         self._importance_cache = None
         self._graph_metrics_cache = None
         self._gravity_map = None
+        # F6: drop the live map + the disk-loaded pending cache on mutation.
+        # NOT _gravity_persist — Hebbian invalidates on a salience-only change
+        # (topology unchanged), and gravity is topology-based, so the map is
+        # still valid to persist; a real topology change is caught by the
+        # node/edge-count version check on the next load.
+        self._gravity_cache_pending = None
         # F5 inverted word index (rebuilt lazily on next propagate).
         self._word_index = None
         self._word_first_char = None
@@ -2500,12 +2509,50 @@ class STGEngine:
     def get_gravity_map(self):
         """Get or build the gravity map (multi-resolution community structure).
 
-        Cached until graph is mutated.
+        Cached until the graph is mutated. F6: on a fresh process a persisted
+        map loaded from disk is restored instead of rebuilt when the graph is
+        unchanged (same node/edge counts as when it was persisted), skipping the
+        ~700ms Louvain + elevation build.
         """
         if self._gravity_map is None:
+            pending = self._gravity_cache_pending
+            if pending is not None:
+                blob, n_nodes, n_edges, built = pending
+                if n_nodes == len(self._nodes) and n_edges == len(self._edges):
+                    import json as _json
+                    from stg_engine.gravity import GravityMap
+                    self._gravity_map = GravityMap(**_json.loads(blob))
+                    # Hold for persistence (reuse the blob, no re-serialize).
+                    self._gravity_persist = (blob, n_nodes, n_edges, built)
+                    return self._gravity_map
+                # Counts changed -> stale; drop so we don't re-check every call.
+                self._gravity_cache_pending = None
             from stg_engine.gravity import build_gravity_map
             self._gravity_map = build_gravity_map(self)
+            # Capture the persistence payload NOW (build-time counts), so it
+            # survives the salience-only invalidation Hebbian triggers before save.
+            self._gravity_persist = (
+                self._serialize_gravity_map(self._gravity_map),
+                len(self._nodes), len(self._edges),
+                self._gravity_map.built_at,
+            )
         return self._gravity_map
+
+    @staticmethod
+    def _serialize_gravity_map(gm) -> str:
+        import dataclasses as _dc
+        import json as _json
+        return _json.dumps(_dc.asdict(gm), ensure_ascii=False)
+
+    def _gravity_cache_payload(self):
+        """(blob, node_count, edge_count, built_at) to persist, or None.
+
+        The last built/restored gravity map, captured at BUILD time with the
+        graph's counts then, so it survives Hebbian's post-propagate
+        salience-only invalidation. A future load restores it only when those
+        counts still match the graph (a topology change forces a rebuild).
+        """
+        return self._gravity_persist
 
     # ═══════════════════════════════════════════════════════════
     # Learning (Phase 7B)
@@ -2897,6 +2944,7 @@ class STGEngine:
             snapshots=self._snapshots,
             force_save=force_save,
             aliases=self._aliases if self._aliases else None,
+            gravity_cache=self._gravity_cache_payload(),
         )
 
     @classmethod
@@ -2945,6 +2993,10 @@ class STGEngine:
 
         # G7: Load aliases if present
         engine._aliases = state.get("aliases", {})
+
+        # F6: stash the persisted gravity map (lazy — restored by get_gravity_map
+        # only if the graph counts still match).
+        engine._gravity_cache_pending = state.get("gravity_cache")
 
         return engine
 

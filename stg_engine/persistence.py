@@ -262,6 +262,18 @@ CREATE TABLE IF NOT EXISTS skill_invocations (
 );
 CREATE INDEX IF NOT EXISTS idx_skill_inv_time ON skill_invocations(timestamp);
 CREATE INDEX IF NOT EXISTS idx_skill_inv_name ON skill_invocations(skill_name);
+
+-- Gravity map cache (F6): persist the built GravityMap so the CLI per-process
+-- cold-start rebuild (Louvain x3 + elevation, ~700ms) is skipped when the graph
+-- is unchanged. Single row (id=1); the engine reuses it only when its stored
+-- node/edge counts match the loaded graph, otherwise it rebuilds.
+CREATE TABLE IF NOT EXISTS gravity_cache (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    data TEXT NOT NULL,
+    node_count INTEGER NOT NULL,
+    edge_count INTEGER NOT NULL,
+    built_at REAL NOT NULL
+);
 """
 
 
@@ -518,6 +530,7 @@ def save_engine_state(
     snapshots: List[SystemSnapshot],
     force_save: bool = False,
     aliases: Optional[Dict[str, str]] = None,
+    gravity_cache: Optional[tuple] = None,
 ) -> None:
     """Serialize full engine state to .stg file.
 
@@ -682,6 +695,16 @@ def save_engine_state(
                 [(a, c, now) for a, c in aliases.items()],
             )
 
+        # --- Gravity map cache (F6) ---
+        # Write the engine's freshly-built map when it hands us one; otherwise
+        # the preservation block below keeps the old cache iff it still matches.
+        if gravity_cache is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO gravity_cache "
+                "(id, data, node_count, edge_count, built_at) VALUES (1, ?, ?, ?, ?)",
+                gravity_cache,
+            )
+
         # --- Preserve append-only tables from old file ---
         if stg_path.exists():
             old_conn = sqlite3.connect(str(stg_path))
@@ -732,6 +755,23 @@ def save_engine_state(
                             f"INSERT INTO {tbl_name} ({cols}) VALUES ({placeholders})",
                             old_rows,
                         )
+
+            # Gravity cache: if the engine didn't supply a fresh map, preserve
+            # the old one ONLY when it still matches the graph being saved (same
+            # node/edge counts); otherwise it is stale, so drop it.
+            if gravity_cache is None and "gravity_cache" in old_tables:
+                grow = old_conn.execute(
+                    "SELECT data, node_count, edge_count, built_at "
+                    "FROM gravity_cache WHERE id = 1"
+                ).fetchone()
+                if (grow is not None and grow[1] == new_node_count
+                        and grow[2] == new_edge_count):
+                    conn.execute(
+                        "INSERT OR REPLACE INTO gravity_cache "
+                        "(id, data, node_count, edge_count, built_at) "
+                        "VALUES (1, ?, ?, ?, ?)",
+                        grow,
+                    )
 
             old_conn.close()
 
@@ -1036,6 +1076,19 @@ def load_engine_state(path: str) -> Dict[str, Any]:
         for row in rows:
             aliases[row["alias"]] = row["canonical"]
     result["aliases"] = aliases
+
+    # --- Gravity map cache (F6) ---
+    result["gravity_cache"] = None
+    if "gravity_cache" in tables:
+        grow = conn.execute(
+            "SELECT data, node_count, edge_count, built_at "
+            "FROM gravity_cache WHERE id = 1"
+        ).fetchone()
+        if grow is not None:
+            result["gravity_cache"] = (
+                grow["data"], grow["node_count"],
+                grow["edge_count"], grow["built_at"],
+            )
 
     # --- Migration for older schema ---
     _migrate_schema(conn)
