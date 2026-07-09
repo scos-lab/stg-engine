@@ -6,6 +6,60 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — Interprocess write lock (multi-session safety)
+
+Concurrent `stg` write commands no longer clobber each other. Every write
+command loads the whole graph, mutates it in memory and saves the whole graph
+back (atomic tmp+rename) — previously with **no interprocess lock**, so two
+overlapping sessions could each load the same base and the second save would
+silently overwrite the first (graph-level lost update), or collide on the temp
+file. New `stg_engine/interlock.py` provides a cross-platform advisory lock
+(POSIX `fcntl.flock`, Windows `msvcrt.locking`, stdlib only) on a sidecar
+`<stg>.lock`. Whole-graph writers take an exclusive lock for their run; reads
+take no lock (SQLite + the atomic rename already give a consistent old-or-new
+snapshot).
+
+**New user-visible behavior**: overlapping write commands serialize; a command
+that waits >15s for the lock fails with a clear "could not acquire STG write
+lock" message instead of corrupting the graph. `stg use <skill>` and read
+commands are never blocked. `STG_NO_INTERLOCK=1` disables it (recovery escape
+hatch). Library callers (HTTP server, embedded use) are intentionally not
+locked — this is a CLI-layer policy. Cross-platform note: `msvcrt` has no
+shared-lock mode, so Windows always takes an exclusive lock (we only ever take
+exclusive locks, so this is exact).
+
+### Performance — `propagate` seed matching ~17× faster
+
+`propagate` re-tokenized and morphology-checked every node on every call. It now
+builds a lazy inverted word index (word → nodes) and scans only a candidate
+superset. In-process steady-state propagate on a ~9.4k-node graph dropped from
+~62ms to ~3.5ms P50 (~17×); sparse queries are near-instant. Behavior-compatible:
+the set of recalled nodes is unchanged.
+
+### Performance — gravity map persistence
+
+The gravity map (Louvain communities + elevation, ~700–900ms to build) was
+rebuilt by every `stg` process. It is now persisted to a `gravity_cache` table
+and restored (~15ms) when the graph is unchanged (same node/edge counts), else
+rebuilt. Cold `stg propagate` drops ~1.6s → ~0.7s. The `.stg` grows ~3MB for the
+cache. Old `.stg` files without the table load normally (additive schema).
+
+### Fixed — reproducible `propagate` ordering
+
+`propagate`'s output order was non-deterministic across (and within) processes —
+equal-activation nodes inherited the Rust core's randomized HashMap iteration
+order. Added a stable secondary sort key (node name). The recalled *set* was
+always correct; only tie order was unstable. (High-hit queries retain sub-ULP
+float-summation order noise pending a Rust-core change.)
+
+### Changed — internal cleanups (no behavior change)
+
+propagate's stop-word set and morphological-suffix table are now module-level
+constants (were rebuilt per call); deduped a doubled stop word; replaced an
+`__import__("math")` with a top-level import; hoisted a `ConflictDetector`
+import. All `.stg` schema additions use `CREATE TABLE IF NOT EXISTS` and are
+backward-compatible.
+
 ### Added — Namespace-aware `stg dump` and `stg query`
 
 Namespace is now a first-class browsing primitive across both inspection

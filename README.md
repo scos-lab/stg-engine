@@ -108,6 +108,7 @@ stg_engine/                Pure Python — no compilation required
 ├── gravity.py             Gravitational propagation + community detection
 ├── learning.py            Hebbian learner + synaptic pruner
 ├── persistence.py         .stg file format (SQLite-backed)
+├── interlock.py           Cross-platform write lock (multi-session safety)
 └── cli.py                 The `stg` command-line tool
 ```
 

@@ -50,6 +50,19 @@ stg config set default-agent your-agent-name
 
 The first call auto-creates `~/.stg/<agent-name>/memory.stg`.
 
+### Concurrent access — the write lock
+
+Multiple processes can safely use the *same* agent's graph at once. Write
+commands (`ingest`, `propagate`, `merge`, `feedback`, …) take an exclusive lock
+on a sidecar `<memory.stg>.lock` for the duration of their run, so two
+overlapping writers serialize instead of one silently overwriting the other's
+save. Reads (`stats`, `query`, `node`, `paths`, …) and `use <skill>` never block.
+
+If a write command can't acquire the lock within 15 seconds it fails with a
+clear `could not acquire STG write lock` error (instead of corrupting the graph)
+— just retry. Set `STG_NO_INTERLOCK=1` to bypass the lock (recovery only). On
+Windows the lock is always exclusive (`msvcrt` has no shared mode).
+
 ---
 
 ## Essential Commands (80% of what you need)
