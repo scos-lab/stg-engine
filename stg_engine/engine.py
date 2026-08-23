@@ -2065,28 +2065,7 @@ class STGEngine:
         # learning signal or pollute telemetry counters meant for the agent's
         # own CLI propagations.
         if not read_only:
-            # Hebbian learning hook (Phase 7B)
-            learning_events = []
-            if self._learner is not None:
-                learning_events = self._learner.learn_from_propagation(
-                    self, activation_map
-                )
-                self._learning_log.extend(learning_events)
-
-            # Telemetry hook (Phase 10)
-            if self._telemetry is not None:
-                strengthen_count = sum(
-                    1 for e in learning_events if e.event_type == "strengthen"
-                )
-                weaken_count = sum(
-                    1 for e in learning_events if e.event_type == "weaken"
-                )
-                self._telemetry.record_propagation(
-                    self._last_propagation_metrics, activation_map,
-                    strengthen_count, weaken_count,
-                )
-                if learning_events:
-                    self._telemetry.record_edge_mutations(learning_events)
+            self.apply_learning_tail(activation_map)
 
         return [self._dn(name) for name, _ in activated]
 
@@ -2584,6 +2563,26 @@ class STGEngine:
     def disable_learning(self) -> None:
         """Disable auto-learning after propagate()."""
         self._learner = None
+
+    def apply_learning_tail(self, activation_map: Dict[str, float]) -> None:
+        """Hebbian learning + telemetry for one activation map (the write tail of propagate()).
+
+        Exposed so wrappers that run several read_only sub-propagates (multi-seed chain intersection)
+        can learn ONCE from the merged result instead of paying the full-edge-scan learner per token
+        (10 tokens × ~1.2 s on a 21k-edge graph, measured 2026-08-23).
+        """
+        learning_events = []
+        if self._learner is not None:
+            learning_events = self._learner.learn_from_propagation(self, activation_map)
+            self._learning_log.extend(learning_events)
+        if self._telemetry is not None:
+            strengthen_count = sum(1 for e in learning_events if e.event_type == "strengthen")
+            weaken_count = sum(1 for e in learning_events if e.event_type == "weaken")
+            self._telemetry.record_propagation(
+                self._last_propagation_metrics, activation_map, strengthen_count, weaken_count,
+            )
+            if learning_events:
+                self._telemetry.record_edge_mutations(learning_events)
 
     @property
     def learning_enabled(self) -> bool:

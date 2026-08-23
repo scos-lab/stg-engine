@@ -46,6 +46,11 @@ EDGE_SCAN_FIELDS: Tuple[str, ...] = (
     "description", "lesson", "action", "role", "status", "is_a",
 )
 DEFAULT_MAX_EDGE_HITS = 50
+# Bounds for multi-seed chain extraction (see multi_seed_propagate)
+MAX_CHAIN_SUBGRAPH_EDGES = 300
+MAX_CHAIN_PATHS = 2000
+MAX_CHAIN_LEN = 6
+MAX_CHAIN_SECONDS = 0.5
 DEFAULT_MIN_EDGE_TOKEN_LENGTH = 3
 
 # Lightweight tokenizer for multi-seed dispatch decision.
@@ -516,15 +521,17 @@ def multi_seed_propagate(
     nodes_per_token: List[set] = []
     name_lookup: Dict[str, str] = {}  # lower → display case
 
+    # Per-token sub-propagates are read_only (no Hebbian/telemetry tail each); learning is applied once,
+    # on the merged result, at the end — see engine.apply_learning_tail.
     for token in tokens:
         if use_gravity:
             from stg_engine.gravity import gravitational_propagate
             gravity_map = engine.get_gravity_map()
             activated = gravitational_propagate(
-                engine, token, gravity_map, resolution=resolution,
+                engine, token, gravity_map, resolution=resolution, read_only=True,
             )
         else:
-            activated = engine.propagate(token)
+            activated = engine.propagate(token, read_only=True)
 
         if not activated or len(activated) < 2:
             continue
@@ -539,10 +546,18 @@ def multi_seed_propagate(
             subgraph = None
 
         chains: List[List[str]] = []
-        if subgraph is not None and subgraph.number_of_edges() > 0:
+        # Chain extraction enumerates simple paths — combinatorial on dense subgraphs (a prose-token query spun
+        # for minutes on 2026-08-23). Bound it: skip very dense subgraphs, cap paths/length/time otherwise.
+        if subgraph is not None and 0 < subgraph.number_of_edges() <= MAX_CHAIN_SUBGRAPH_EDGES:
             try:
                 stl_g = STLGraph.from_networkx(subgraph)
-                chains = stl_g.extract_chains(min_length=min_chain_length)
+                try:
+                    chains = stl_g.extract_chains(
+                        min_length=min_chain_length, max_paths=MAX_CHAIN_PATHS,
+                        cutoff=MAX_CHAIN_LEN, time_budget_s=MAX_CHAIN_SECONDS,
+                    )
+                except TypeError:   # older stl_parser without bounds
+                    chains = stl_g.extract_chains(min_length=min_chain_length)
             except Exception:
                 chains = []
 
@@ -577,12 +592,26 @@ def multi_seed_propagate(
                     seen_in_chain.add(k)
         # Activated-but-no-chain singletons get appearance 0; ranked last.
 
+    # Deterministic order: appearance desc, shorter name first, then the key itself — without the final
+    # tie-break the order followed set iteration, i.e. PYTHONHASHSEED, and differed across processes.
     sorted_keys = sorted(
         intersection,
-        key=lambda k: (appearance.get(k, 0), -len(k)),  # tiebreaker: shorter name first
-        reverse=True,
+        key=lambda k: (-appearance.get(k, 0), len(k), k),
     )
     display_names = [name_lookup.get(k, k) for k in sorted_keys]
+
+    # one learning/telemetry pass over the merged activation (was: once per token)
+    try:
+        if engine.learning_enabled or engine.telemetry_enabled:
+            amap = {}
+            for k in sorted_keys:
+                node = engine._nodes.get(k)
+                if node is not None and node.activation > 0:
+                    amap[k] = node.activation
+            if amap:
+                engine.apply_learning_tail(amap)
+    except Exception:
+        pass
 
     return display_names, per_token_data
 
