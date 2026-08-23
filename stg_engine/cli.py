@@ -359,6 +359,107 @@ def load_engine():
     return engine
 
 
+def _doctor_report(engine, since_ts=None, sample=5):
+    """Graph hygiene (SKC kernel line 2026-08-23, absentia advice §4): islands are a hygiene defect, not something
+    to discover in a bench. Real edges only — virtual (xref) edges carry no activation, so they must not make the
+    graph look more connected than it is. Returns a dict; `stg doctor` renders it."""
+    import networkx as nx
+    from stg_engine.engine import SEMANTIC_FIELDS
+    nk = engine._nk
+    R = nx.Graph()
+    R.add_nodes_from(engine._nodes.keys())
+    deg = {k: 0 for k in engine._nodes}
+    vdeg = {k: 0 for k in engine._nodes}
+    first_real = {}
+    shell_edges = []
+    for e in engine._edges:
+        m = e.modifiers or {}
+        s, t = nk(e.source), nk(e.target)
+        if m.get("edge_class") == "virtual":
+            vdeg[s] = vdeg.get(s, 0) + 1; vdeg[t] = vdeg.get(t, 0) + 1
+            continue
+        deg[s] = deg.get(s, 0) + 1; deg[t] = deg.get(t, 0) + 1
+        if s != t:
+            R.add_edge(s, t)
+        try:
+            ts = float(e.created_at or 0)
+        except Exception:
+            ts = 0.0
+        for x in (s, t):
+            if ts and (x not in first_real or ts < first_real[x]):
+                first_real[x] = ts
+        if not any(m.get(f) for f in SEMANTIC_FIELDS) and not e.is_intrinsic_property():
+            shell_edges.append(e)
+    comps = sorted(nx.connected_components(R), key=len, reverse=True)
+    n = len(engine._nodes)
+    zero = [k for k in engine._nodes if deg.get(k, 0) == 0 and vdeg.get(k, 0) == 0]
+    virtual_only = [k for k in engine._nodes if deg.get(k, 0) == 0 and vdeg.get(k, 0) > 0]
+    sizes = [len(c) for c in comps]
+    hist = {}
+    for sz in sizes:
+        b = "1" if sz == 1 else "2-9" if sz < 10 else "10-99" if sz < 100 else "100+"
+        hist[b] = hist.get(b, 0) + 1
+    new_islands = []
+    if since_ts is not None:
+        old = {k for k, ts in first_real.items() if ts < since_ts}
+        for c in comps:
+            if len(c) and not (c & old) and any(first_real.get(k, 0) >= since_ts for k in c):
+                new_islands.append(sorted(c)[:3])
+    return {
+        "nodes": n, "real_edges": sum(deg.values()) // 2, "components": len(comps),
+        "largest": sizes[0] if sizes else 0, "largest_share": (sizes[0] / n) if n else 0.0, "size_hist": hist,
+        "zero_degree": zero, "virtual_only": virtual_only, "shell_edges": shell_edges, "new_islands": new_islands,
+    }
+
+
+def cmd_doctor(engine, since=None, sample=5):
+    """`stg doctor [--since ISO]` — graph hygiene report; exit 2 when something needs attention."""
+    since_ts = None
+    if since:
+        from datetime import datetime as _dt
+        try:
+            since_ts = _dt.fromisoformat(since).timestamp()
+        except ValueError:
+            try:
+                since_ts = float(since)
+            except ValueError:
+                print(f"bad --since {since!r} (ISO8601 or epoch)"); return 1
+    r = _doctor_report(engine, since_ts, sample)
+    dn = engine._dn
+    print(f"stg doctor · {r['nodes']} nodes · {r['real_edges']} real edges")
+    print(f"  components (real edges): {r['components']}  largest {r['largest']} ({r['largest_share']*100:.1f}%)  sizes {r['size_hist']}")
+    print(f"  zero-degree nodes: {len(r['zero_degree'])}" + (f"  e.g. {[dn(k) for k in r['zero_degree'][:sample]]}" if r['zero_degree'] else ""))
+    print(f"  virtual-only nodes (no real edge): {len(r['virtual_only'])}" + (f"  e.g. {[dn(k) for k in r['virtual_only'][:sample]]}" if r['virtual_only'] else ""))
+    print(f"  shell edges (no meta semantic field): {len(r['shell_edges'])}" + (f"  e.g. {[f'{e.source}->{e.target}' for e in r['shell_edges'][:sample]]}" if r['shell_edges'] else ""))
+    if since_ts is not None:
+        print(f"  new islands since {since}: {len(r['new_islands'])}" + (f"  e.g. {[[dn(k) for k in c] for c in r['new_islands'][:sample]]}" if r['new_islands'] else ""))
+    flagged = bool(r['zero_degree'] or r['virtual_only'] or r['new_islands'])
+    if flagged:
+        print("  → islands: bind them (`stg bind`, or ingest an edge to an existing node); zero-degree/virtual-only nodes are usually residue of renamed anchors")
+    return 2 if flagged else 0
+
+
+def _island_warning(engine, new_node_keys):
+    """After an ingest: warn when a newly created node has no real-edge path to a pre-existing node."""
+    if not new_node_keys:
+        return
+    import networkx as nx
+    nk = engine._nk
+    R = nx.Graph()
+    R.add_nodes_from(engine._nodes.keys())
+    for e in engine._edges:
+        if (e.modifiers or {}).get("edge_class") == "virtual":
+            continue
+        R.add_edge(nk(e.source), nk(e.target))
+    new = set(new_node_keys)
+    for k in new:
+        comp = nx.node_connected_component(R, k) if k in R else {k}
+        if not (comp - new):
+            print(f"⚠ island: new node(s) {sorted(engine._dn(x) for x in comp)} connect to nothing that existed before — "
+                  f"bind them (stg bind / an edge to an existing node) or recall will never reach them")
+            break
+
+
 def cmd_stats(engine):
     s = engine.get_stats()
     print(f"Nodes: {s['node_count']}")
@@ -2215,6 +2316,7 @@ def cmd_ingest(engine, stl_text, edge_class="knowledge", no_link=False):
     print(f"Ingested {count} edge(s) (edge_class={edge_class}). Saved to memory.stg.")
     s = engine.get_stats()
     print(f"Graph: {s['node_count']} nodes, {s['edge_count']} edges")
+    _island_warning(engine, new_nodes)
 
     if not new_nodes or no_link:
         return
@@ -2397,11 +2499,13 @@ def cmd_ingest_file(engine, file_path, created_at=None):
     if not os.path.exists(file_path):
         print(f"File not found: {file_path}")
         return
+    nodes_before = set(engine._nodes.keys())
     count = engine.ingest_stl_file(file_path, created_at=created_at)
     _cli_save(engine)
     print(f"Ingested {count} edge(s) from {os.path.basename(file_path)}. Saved to memory.stg.")
     s = engine.get_stats()
     print(f"Graph: {s['node_count']} nodes, {s['edge_count']} edges")
+    _island_warning(engine, set(engine._nodes.keys()) - nodes_before)
 
 
 def cmd_merge(engine, stl_text):
@@ -4575,6 +4679,12 @@ def main():
 
     if cmd == "stats":
         cmd_stats(engine)
+    elif cmd == "doctor":
+        since = None
+        if "--since" in sys.argv:
+            i = sys.argv.index("--since")
+            since = sys.argv[i + 1] if i + 1 < len(sys.argv) else None
+        sys.exit(cmd_doctor(engine, since=since))
     elif cmd == "psi":
         cmd_psi(engine)
     elif cmd == "import-doc" and len(sys.argv) >= 3:
