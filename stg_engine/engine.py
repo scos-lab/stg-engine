@@ -783,7 +783,19 @@ class STGEngine:
         # same (semantic_field, value) but DIFFERENT target — the only
         # configuration that signals an actual correction.
         existing_edge = self._edges_lookup.get((_src, _tgt))
-        if existing_edge and existing_edge.modifiers.get("edge_class") != "virtual":
+        # A virtual edge must never mask a real one — when a proximity hint
+        # already sits on this pair and a real edge arrives, fall through and
+        # create it. But virtual-over-virtual IS a true duplicate: without
+        # this the sibling generator re-emits the same hint on every ingest
+        # that touches the parent, and the pair accumulates without bound
+        # (measured 2026-08-30: 20323 virtual edges over 5029 distinct pairs,
+        # worst pair repeated 65x).
+        _new_is_virtual = modifiers.get("edge_class") == "virtual"
+        _existing_is_virtual = (
+            existing_edge is not None
+            and existing_edge.modifiers.get("edge_class") == "virtual"
+        )
+        if existing_edge and (not _existing_is_virtual or _new_is_virtual):
             # Check if new edge is semantically identical to existing
             same_conf = abs(existing_edge.confidence - confidence) < 0.001
             same_strength = abs(existing_edge.strength - strength) < 0.001
@@ -1212,7 +1224,7 @@ class STGEngine:
         self,
         stl_text: str,
         session_id: Optional[str] = None,
-        auto_virtual: bool = True,
+        auto_virtual: bool = False,
         created_at: Optional[float] = None,
     ) -> int:
         """Parse STL text and add all statements to the graph.
@@ -1220,7 +1232,11 @@ class STGEngine:
         Args:
             stl_text: Raw STL text containing statements
             session_id: Optional session to associate edges with
-            auto_virtual: If True, auto-create virtual edges between siblings
+            auto_virtual: If True, auto-create virtual edges between siblings.
+                Defaults to False — virtual edges are proximity hints that
+                measurably do not change retrieval ranking, while inflating
+                the graph and burying the temporal face in clique noise.
+                Opt in via `stg config set virtual.enabled true`.
             created_at: Custom creation timestamp (epoch float). Defaults to current time.
 
         Returns:
@@ -1335,7 +1351,7 @@ class STGEngine:
         path: str,
         session_id: Optional[str] = None,
         created_at: Optional[float] = None,
-        auto_virtual: bool = True,
+        auto_virtual: bool = False,
     ) -> int:
         """Parse a text file containing STL statements and add to graph.
 
@@ -1345,7 +1361,8 @@ class STGEngine:
             path: Path to file containing STL statements
             session_id: Optional session to associate with
             created_at: Custom creation timestamp (epoch float). Defaults to current time.
-            auto_virtual: If True, auto-create virtual edges between siblings.
+            auto_virtual: If True, auto-create virtual edges between siblings
+                (default False — see ingest_stl).
 
         Returns:
             Number of edges added
@@ -1358,7 +1375,7 @@ class STGEngine:
         self,
         stl_text: str,
         session_id: Optional[str] = None,
-        auto_virtual: bool = True,
+        auto_virtual: bool = False,
         created_at: Optional[float] = None,
     ) -> int:
         """Fallback STL parser using regex for simple statements.
@@ -1639,16 +1656,50 @@ class STGEngine:
     def clear_virtual_edges(self) -> int:
         """Remove all virtual edges from the graph.
 
+        Removes by edge *identity*, not by (source, target) key. A pair can
+        carry several parallel edges, and remove_edge() drops only the one
+        the lookup happens to point at — so the old key-based loop was both
+        non-idempotent (one pass left ~75% of the duplicates behind, needing
+        a dozen more) and destructive (it deleted the real edge whenever a
+        real and a virtual edge shared a pair). Measured on the live graph
+        2026-08-30 before this fix: one pass cleared 5029 of 20323 virtual
+        edges and took 2 real knowledge edges with it.
+
         Returns:
-            Number of virtual edges removed
+            Number of virtual edges actually removed
         """
-        to_remove = [
-            (e.source, e.target) for e in self._edges
-            if e.modifiers.get("edge_class") == "virtual"
-        ]
-        for src, tgt in to_remove:
-            self.remove_edge(src, tgt)
-        return len(to_remove)
+        survivors = []
+        removed = 0
+        for e in self._edges:
+            if e.modifiers.get("edge_class") == "virtual":
+                removed += 1
+            else:
+                survivors.append(e)
+        if not removed:
+            return 0
+        self._edges = survivors
+        self._reindex_edges()
+        self._invalidate_caches()
+        return removed
+
+    def _reindex_edges(self) -> None:
+        """Rebuild _edges_lookup and _graph edges from self._edges.
+
+        Call after any bulk removal that bypasses remove_edge(). Mirrors the
+        indexing done when a graph is loaded from disk: last edge wins per
+        pair, and a graph edge survives only while some edge still uses it.
+        """
+        _nk = self._nk
+        lookup = {}
+        live_pairs = set()
+        for edge in self._edges:
+            key = (_nk(edge.source), _nk(edge.target))
+            lookup[key] = edge
+            live_pairs.add(key)
+        self._edges_lookup = lookup
+        for src, tgt in [e for e in self._graph.edges()]:
+            if (src, tgt) not in live_pairs:
+                self._graph.remove_edge(src, tgt)
 
     def get_virtual_edge_stats(self) -> Dict[str, Any]:
         """Return statistics about virtual edges."""

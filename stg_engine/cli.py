@@ -165,6 +165,71 @@ def _write_user_config(config: dict):
         f.write("\n")
 
 
+def _virtual_enabled() -> bool:
+    """Whether ingest should auto-create virtual (sibling proximity) edges.
+
+    Default False. Virtual edges were measured on the live graph 2026-08-30
+    to leave propagate's ranking unchanged (same top-1 and same ordering with
+    them purged) while accounting for 66% of all edges and burying
+    `temporal range` under clique noise. Re-enable per user with:
+
+        stg config set virtual.enabled true
+    """
+    cfg = _read_user_config()
+    section = cfg.get("virtual")
+    if isinstance(section, dict):
+        return section.get("enabled") is True
+    return False
+
+
+_DEFAULT_HIDDEN_ROLES = ("verdict", "used_in_handling")
+
+
+def _hidden_roles() -> set:
+    """Roles whose edges recall output hides by default.
+
+    These are bookkeeping records — board-item pass/fail verdicts, "tool was
+    used while handling X" traces — worth keeping as records but burying the
+    semantic content when rendered (measured 2026-08-30: ~65% of a week's
+    knowledge edges were such records, all with empty descriptions). They are
+    never deleted and never excluded from activation dynamics — this is a
+    display-layer filter only, bypassed per command with --all. Tune with:
+
+        stg config set recall.hide_roles "verdict,used_in_handling"
+
+    An explicit empty value ("") disables hiding entirely.
+    """
+    cfg = _read_user_config()
+    section = cfg.get("recall")
+    if isinstance(section, dict) and "hide_roles" in section:
+        v = section["hide_roles"]
+        if isinstance(v, list):
+            return {str(x) for x in v}
+        if isinstance(v, str):
+            return {x.strip() for x in v.split(",") if x.strip()}
+    return set(_DEFAULT_HIDDEN_ROLES)
+
+
+def _is_low_signal_edge(edge, hidden_roles) -> bool:
+    """True when the edge is a bookkeeping record hidden from recall output."""
+    return edge.modifiers.get("role") in hidden_roles
+
+
+def _auto_bind_enabled() -> bool:
+    """Whether ingest auto-binds new nodes to same-community candidates.
+
+    Default False — the documented workflow is ingest → review candidates →
+    explicit `stg bind`. Auto-bind guesses up to 5 context edges per new node
+    from a propagate over the node name; measured retrieval value ≈ 0
+    (2026-08-30 A/B). Re-enable with: stg config set bind.auto_enabled true
+    """
+    cfg = _read_user_config()
+    section = cfg.get("bind")
+    if isinstance(section, dict):
+        return section.get("auto_enabled") is True
+    return False
+
+
 def _load_settings():
     """Load agent settings from ~/.stg/<agent>/stg_settings.json.
 
@@ -606,7 +671,7 @@ def cmd_grep(engine, pattern, limit=20, full=False):
             print(f"    {desc}")
 
 
-def cmd_query(engine, pattern, limit=20):
+def cmd_query(engine, pattern, limit=20, show_all=False):
     """Fuzzy node search with optional namespace scoping.
 
     Pattern grammar:
@@ -623,17 +688,41 @@ def cmd_query(engine, pattern, limit=20):
         namespace = None
         name_pattern = pattern
 
-    nodes = engine.query_nodes(
-        name_pattern=name_pattern, namespace=namespace, limit=limit,
+    nodes_all = engine.query_nodes(
+        name_pattern=name_pattern, namespace=namespace, limit=10000,
     )
-    if not nodes:
+    if not nodes_all:
         print(f"No nodes matching '{pattern}'")
         return
-    total = len(engine.query_nodes(
-        name_pattern=name_pattern, namespace=namespace, limit=10000,
-    ))
+    # Node-level recall filter: a node whose every edge is a hidden
+    # bookkeeping record (or virtual) is itself a bookkeeping record — e.g.
+    # per-item Verdict: nodes, which otherwise crowd the listing cap and push
+    # real hits out of view. Nodes with no edges at all stay visible (islands
+    # are a health signal, not noise). One pass over the edge list.
+    n_low_nodes = 0
+    if not show_all:
+        _hr = _hidden_roles()
+        _touched, _has_signal = set(), set()
+        for _e in engine._edges:
+            _sk, _tk = engine._nk(_e.source), engine._nk(_e.target)
+            _touched.add(_sk)
+            _touched.add(_tk)
+            if (_e.modifiers.get("edge_class") != "virtual"
+                    and not _is_low_signal_edge(_e, _hr)):
+                _has_signal.add(_sk)
+                _has_signal.add(_tk)
+        _low_keys = _touched - _has_signal
+        _n_before = len(nodes_all)
+        nodes_all = [n for n in nodes_all if engine._nk(n.name) not in _low_keys]
+        n_low_nodes = _n_before - len(nodes_all)
+    total = len(nodes_all)
+    nodes = nodes_all[:limit]
     shown = len(nodes)
     suffix = f" (showing {shown}/{total})" if total > shown else ""
+    if not nodes:
+        print(f"No nodes matching '{pattern}' "
+              f"({n_low_nodes} low-signal node(s) hidden, use --all to show)")
+        return
     print(f"Nodes matching '{pattern}'{suffix}:")
     for n in nodes:
         display = f"{n.namespace}:{n.name}" if n.namespace else n.name
@@ -646,6 +735,8 @@ def cmd_query(engine, pattern, limit=20):
         if comm:
             parts.append(f"[{comm}]")
         print(" | ".join(parts))
+    if n_low_nodes:
+        print(f"  (+ {n_low_nodes} low-signal node(s) hidden, use --all to show)")
 
     # Helper: namespace-prefixed display name for edge endpoints
     def _ns_label(name: str) -> str:
@@ -674,6 +765,12 @@ def cmd_query(engine, pattern, limit=20):
                     and node.namespace.lower() == ns_lower
                 )
             related = [e for e in related if _in_ns(e.source) or _in_ns(e.target)]
+        n_low = 0
+        if related and not show_all:
+            _hr = _hidden_roles()
+            n_before = len(related)
+            related = [e for e in related if not _is_low_signal_edge(e, _hr)]
+            n_low = n_before - len(related)
         if related:
             print(f"\nRelated edges ({len(related)}):")
             for e in related[:10]:
@@ -689,6 +786,8 @@ def cmd_query(engine, pattern, limit=20):
                 mod_lines, _ = _format_edge_modifiers(e, indent="    ")
                 for line in mod_lines:
                     print(line)
+        if n_low:
+            print(f"  (+ {n_low} low-signal record(s) hidden, use --all to show)")
 
 
 def cmd_dump(engine, page_size=100, start=0, namespace=None):
@@ -1047,7 +1146,7 @@ def _community_label(engine, node_name, resolution="medium"):
         return ""
 
 
-def cmd_propagate(engine, text, use_gravity=False, resolution="medium", all_chains=False, all_modifiers=False, expand_top=3, community_mode=True, top_m=5, brief=False, show_virtual=False,
+def cmd_propagate(engine, text, use_gravity=False, resolution="medium", all_chains=False, all_modifiers=False, expand_top=3, community_mode=True, top_m=5, brief=False, show_virtual=False, show_low_signal=False,
                   no_recency_weight=False, no_community_filter=False,
                   no_context_anchor=False, no_multi_seed=False,
                   no_edge_fallback=False):
@@ -1328,7 +1427,7 @@ def cmd_propagate(engine, text, use_gravity=False, resolution="medium", all_chai
                 # Inline full node detail — edges, modifiers, descriptions.
                 # Skip for reps that weren't reached (no activation) to save tokens.
                 if not brief and rep.activation > 0:
-                    _render_node_detail(engine, rep.node_name, indent="      ", show_virtual=show_virtual)
+                    _render_node_detail(engine, rep.node_name, indent="      ", show_virtual=show_virtual, show_low_signal=show_low_signal)
             # Query-matching nodes inside community that aren't top reps.
             # These are the precise hits that would vanish at the community level.
             if comm.query_seeds:
@@ -1337,7 +1436,7 @@ def cmd_propagate(engine, text, use_gravity=False, resolution="medium", all_chai
                     print(f"    [{c_idx}.s{s_idx}] {seed.node_name}  "
                           f"act={seed.activation:.3f}  elev={seed.elevation:.3f}")
                     if not brief and seed.activation > 0:
-                        _render_node_detail(engine, seed.node_name, indent="      ", show_virtual=show_virtual)
+                        _render_node_detail(engine, seed.node_name, indent="      ", show_virtual=show_virtual, show_low_signal=show_low_signal)
     else:
         print(f"propagate('{text}') → {len(activated)} nodes ({elapsed*1000:.1f}ms){gravity_label}:")
         for idx, name in enumerate(activated, 1):
@@ -1380,8 +1479,13 @@ def cmd_propagate(engine, text, use_gravity=False, resolution="medium", all_chai
     # node result (= both topic-matched and fact-matched, highest priority).
     if edge_hits_data:
         activated_lower = {n.lower() for n in activated} if activated else set()
-        print(f"\n🪢 Event-edge matches ({len(edge_hits_data)}):")
-        for edge, matched, score in edge_hits_data:
+        eh_shown = edge_hits_data
+        if not show_low_signal:
+            _hr = _hidden_roles()
+            eh_shown = [t for t in edge_hits_data if not _is_low_signal_edge(t[0], _hr)]
+        eh_hidden = len(edge_hits_data) - len(eh_shown)
+        print(f"\n🪢 Event-edge matches ({len(eh_shown)}):")
+        for edge, matched, score in eh_shown:
             label = _format_edge_label(edge)
             double_hit = (edge.source.lower() in activated_lower) or (edge.target.lower() in activated_lower)
             mark = "  🔗 双重命中" if double_hit else ""
@@ -1391,6 +1495,8 @@ def cmd_propagate(engine, text, use_gravity=False, resolution="medium", all_chai
                 desc_short = desc if len(desc) <= 120 else desc[:117] + "..."
                 print(f"     {desc_short}")
             print(f"     matched: {', '.join(matched)}")
+        if eh_hidden:
+            print(f"  (+ {eh_hidden} low-signal edge match(es) hidden, use --all to show)")
 
     # Show learning summary
     log = engine.learning_log
@@ -1580,6 +1686,9 @@ def cmd_config(args):
       skill.default_timeout_s           — int, fallback timeout when Skill edge doesn't specify (default: 60)
       skill.max_timeout_s               — int, hard cap applied to any resolved timeout (default: 600)
       skill.output_cap_bytes            — int, max captured stdout (default: 10485760)
+      virtual.enabled                   — bool, auto-create sibling proximity edges on ingest (default: false)
+      bind.auto_enabled                 — bool, auto-bind new nodes to community candidates on ingest (default: false; explicit `stg bind` always works)
+      recall.hide_roles                 — list[str], edge roles hidden from recall output; --all bypasses per command (default: verdict,used_in_handling)
       feedback.session_end_hook         — str, shell-quoted command run after `feedback session-end` succeeds (default: unset). No shell invoked. Use to plug in backups, sync, etc.
       feedback.session_end_hook_timeout_s — int, max seconds the post-hook may run (default: 300)
     """
@@ -1861,7 +1970,7 @@ def _format_edge_attrs(edge) -> str:
     return f" ({', '.join(parts)})" if parts else ""
 
 
-def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None, show_provenance=False):
+def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None, show_provenance=False, show_low_signal=False):
     """Print full node detail with configurable indent.
 
     Extracted from cmd_node so community-mode propagate can inline
@@ -1919,6 +2028,14 @@ def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None,
         in_edges = [e for e in in_edges_all if not _is_virtual_edge(e)]
         out_virtual = len(out_edges_all) - len(out_edges)
         in_virtual = len(in_edges_all) - len(in_edges)
+    out_low = in_low = 0
+    if not show_low_signal:
+        _hr = _hidden_roles()
+        _n_out, _n_in = len(out_edges), len(in_edges)
+        out_edges = [e for e in out_edges if not _is_low_signal_edge(e, _hr)]
+        in_edges = [e for e in in_edges if not _is_low_signal_edge(e, _hr)]
+        out_low = _n_out - len(out_edges)
+        in_low = _n_in - len(in_edges)
     mod_indent = pfx + "      "
     out_shown = out_edges if limit is None else out_edges[:limit]
     in_shown = in_edges if limit is None else in_edges[:limit]
@@ -1942,6 +2059,8 @@ def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None,
             print(f"{pfx}    (+ {out_truncated} more outgoing edge(s) truncated, raise --limit to show)")
     if out_virtual:
         print(f"{pfx}    (+ {out_virtual} virtual edge(s) hidden, use --virtual to show)")
+    if out_low:
+        print(f"{pfx}    (+ {out_low} low-signal record(s) hidden, use --all to show)")
     if in_edges:
         header = f"\n{pfx}  Incoming ({len(in_edges)})"
         if limit is not None and len(in_edges) > limit:
@@ -1959,6 +2078,8 @@ def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None,
             print(f"{pfx}    (+ {in_truncated} more incoming edge(s) truncated, raise --limit to show)")
     if in_virtual:
         print(f"{pfx}    (+ {in_virtual} virtual edge(s) hidden, use --virtual to show)")
+    if in_low:
+        print(f"{pfx}    (+ {in_low} low-signal record(s) hidden, use --all to show)")
     if total_provenance_hidden and not show_provenance:
         plural = "field" if total_provenance_hidden == 1 else "fields"
         print(
@@ -1967,10 +2088,11 @@ def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None,
         )
 
 
-def cmd_node(engine, name, show_virtual=False, limit=None, show_provenance=False):
+def cmd_node(engine, name, show_virtual=False, limit=None, show_provenance=False, show_low_signal=False):
     _render_node_detail(
         engine, name, indent="",
         show_virtual=show_virtual, limit=limit, show_provenance=show_provenance,
+        show_low_signal=show_low_signal,
     )
 
 
@@ -2295,11 +2417,11 @@ def cmd_ingest(engine, stl_text, edge_class="knowledge", no_link=False):
             return original_add_edge(*args, **kwargs)
         engine.add_edge = patched_add_edge
         try:
-            count = engine.ingest_stl(stl_text)
+            count = engine.ingest_stl(stl_text, auto_virtual=_virtual_enabled())
         finally:
             engine.add_edge = original_add_edge
     else:
-        count = engine.ingest_stl(stl_text)
+        count = engine.ingest_stl(stl_text, auto_virtual=_virtual_enabled())
 
     new_nodes = set(engine._nodes.keys()) - nodes_before
 
@@ -2349,16 +2471,21 @@ def cmd_ingest(engine, stl_text, edge_class="knowledge", no_link=False):
             and nc_snap.get(n, {}).get("coarse") == comm_id
         ][:5]  # top 5 same-community
 
-        if same_comm:
+        # Bind edges are the sanctioned reachability mechanism (they keep new
+        # nodes out of island status), so they are real structural edges, not
+        # virtual proximity hints. Auto-bind is still opt-in — the documented
+        # workflow is ingest → review candidates → explicit `stg bind`.
+        if same_comm and _auto_bind_enabled():
             bound = 0
             for new_node in new_nodes:
                 for ctx_node in same_comm:
-                    if ctx_node != new_node and ctx_node in engine._nodes:
+                    if (engine._nk(ctx_node) != engine._nk(new_node)
+                            and engine._nk(ctx_node) in engine._nodes):
                         engine.add_edge(
                             ctx_node, new_node,
                             confidence=0.15,
-                            edge_class="virtual",
-                            virtual_reason="auto_bind",
+                            edge_class="structural",
+                            bind_reason="auto_bind",
                         )
                         bound += 1
             _cli_save(engine)
@@ -2419,17 +2546,23 @@ def cmd_bind(engine, args):
     bound = 0
     for new_node in new_nodes:
         for ctx_node in selected:
-            if ctx_node != new_node and ctx_node in engine._nodes:
+            # Candidates and new_nodes carry display names; engine._nodes is
+            # keyed by normalized names. The un-normalized membership test
+            # made bind silently a no-op for any mixed-case candidate — the
+            # live graph accumulated 8 context_binding edges in months while
+            # every session ran bind as instructed.
+            if (engine._nk(ctx_node) != engine._nk(new_node)
+                    and engine._nk(ctx_node) in engine._nodes):
                 engine.add_edge(
                     ctx_node, new_node,
                     confidence=0.15,
-                    edge_class="virtual",
-                    virtual_reason="context_binding",
+                    edge_class="structural",
+                    bind_reason="context_binding",
                 )
                 bound += 1
 
     _cli_save(engine)
-    print(f"Bound {len(new_nodes)} new node(s) to {len(selected)} candidate(s) ({bound} virtual edge(s)):")
+    print(f"Bound {len(new_nodes)} new node(s) to {len(selected)} candidate(s) ({bound} structural edge(s)):")
     for name in selected:
         print(f"  → {name}")
 
@@ -2500,7 +2633,9 @@ def cmd_ingest_file(engine, file_path, created_at=None):
         print(f"File not found: {file_path}")
         return
     nodes_before = set(engine._nodes.keys())
-    count = engine.ingest_stl_file(file_path, created_at=created_at)
+    count = engine.ingest_stl_file(
+        file_path, created_at=created_at, auto_virtual=_virtual_enabled()
+    )
     _cli_save(engine)
     print(f"Ingested {count} edge(s) from {os.path.basename(file_path)}. Saved to memory.stg.")
     s = engine.get_stats()
@@ -4031,6 +4166,9 @@ def cmd_temporal(engine, subcmd, args):
         epoch_to_str, parse_date_str,
     )
 
+    show_all = "--all" in args
+    args = [a for a in args if a != "--all"]
+
     if subcmd == "range":
         if len(args) < 2:
             print("Usage: temporal range <start_date> <end_date>")
@@ -4053,10 +4191,48 @@ def cmd_temporal(engine, subcmd, args):
                 edge_class = args[idx + 1]
 
         edges = query_time_range(engine, start, end, edge_class=edge_class)
+        # Recall filter: virtual clique edges and low-signal bookkeeping
+        # records (verdicts, tool traces) are hidden by default so this view
+        # answers "what happened" instead of scrolling pass/fail markers.
+        # An explicit --class means the caller asked for exactly that slice;
+        # --all shows everything raw.
+        hidden_low, hidden_virtual = [], 0
+        shown = edges
+        if not show_all and edge_class is None:
+            _hr = _hidden_roles()
+            shown = []
+            for e in edges:
+                if e.edge_class == "virtual" or e.modifiers.get("edge_class") == "virtual":
+                    hidden_virtual += 1
+                elif _is_low_signal_edge(e, _hr):
+                    hidden_low.append(e)
+                else:
+                    shown.append(e)
         print(f"Edges created between {args[0]} and {args[1]}: {len(edges)}")
-        for e in edges[:50]:
+        for e in shown[:50]:
             cls_tag = f" [{e.edge_class}]" if e.edge_class != "knowledge" else ""
-            print(f"  {epoch_to_str(e.created_at)}  [{e.source}] → [{e.target}]{cls_tag}")
+            line = f"  {epoch_to_str(e.created_at)}  [{e.source}] → [{e.target}]{cls_tag}"
+            desc = e.modifiers.get("description") or e.modifiers.get("lesson") or ""
+            if desc:
+                desc = desc if len(desc) <= 80 else desc[:77] + "..."
+                line += f"  | {desc}"
+            print(line)
+        if len(shown) > 50:
+            print(f"  (+ {len(shown) - 50} more edge(s) truncated)")
+        if hidden_low:
+            # Roll hidden records up per work unit: verdicts point item→board
+            # so the board (target) is the unit; other records group by source.
+            per_unit = {}
+            for e in hidden_low:
+                key = e.target if e.modifiers.get("role") == "verdict" else e.source
+                per_unit[key] = per_unit.get(key, 0) + 1
+            top = sorted(per_unit.items(), key=lambda kv: -kv[1])
+            roll = ", ".join(f"{k} ×{n}" for k, n in top[:12])
+            more = f" (+{len(top) - 12} more)" if len(top) > 12 else ""
+            print(f"  ({len(hidden_low)} low-signal record(s) hidden, use --all to show):")
+            print(f"    {roll}{more}")
+        if hidden_virtual:
+            print(f"  ({hidden_virtual} virtual edge(s) hidden, use --all to show)")
 
     elif subcmd == "around":
         if not args:
@@ -4070,7 +4246,16 @@ def cmd_temporal(engine, subcmd, args):
             except ValueError:
                 pass
         edges = query_temporal_neighborhood(engine, node, window_seconds=window_hours * 3600)
-        print(f"Edges within ±{window_hours}h of '{node}': {len(edges)}")
+        n_total = len(edges)
+        if not show_all:
+            _hr = _hidden_roles()
+            edges = [
+                e for e in edges
+                if e.modifiers.get("edge_class") != "virtual"
+                and not _is_low_signal_edge(e, _hr)
+            ]
+        print(f"Edges within ±{window_hours}h of '{node}': {len(edges)}"
+              + (f" ({n_total - len(edges)} hidden, use --all to show)" if n_total > len(edges) else ""))
         for e in edges[:50]:
             marker = " ◄" if e.source == node or e.target == node else ""
             print(f"  {epoch_to_str(e.created_at)}  [{e.source}] → [{e.target}]{marker}")
@@ -4748,7 +4933,10 @@ def main():
                 except ValueError:
                     pass
                 args = args[:idx] + args[idx + 2:]
-        cmd_query(engine, " ".join(args), limit=limit)
+        show_all = "--all" in args
+        if show_all:
+            args = [a for a in args if a != "--all"]
+        cmd_query(engine, " ".join(args), limit=limit, show_all=show_all)
     elif cmd == "tensions":
         status = sys.argv[2] if len(sys.argv) >= 3 else None
         cmd_tensions(engine, status)
@@ -4821,6 +5009,11 @@ def main():
         show_virtual = "--virtual" in args
         if show_virtual:
             args = [a for a in args if a != "--virtual"]
+        # --all reveals everything recall hides by default (virtual + low-signal)
+        show_all = "--all" in args
+        if show_all:
+            args = [a for a in args if a != "--all"]
+            show_virtual = True
         # Precision Recall escape hatches (default: postprocess ON):
         #   --no-recency-weight   disable R1 (recency × supersede soft decay)
         #   --no-community-filter disable R7 (community dominance ratio)
@@ -4849,7 +5042,7 @@ def main():
         cmd_propagate(engine, " ".join(args), use_gravity=use_gravity, resolution=resolution,
                       all_chains=all_chains, all_modifiers=all_modifiers, expand_top=expand_top,
                       community_mode=community_mode, top_m=top_m, brief=brief,
-                      show_virtual=show_virtual,
+                      show_virtual=show_virtual, show_low_signal=show_all,
                       no_recency_weight=no_recency_weight,
                       no_community_filter=no_community_filter,
                       no_context_anchor=no_context_anchor,
@@ -4868,7 +5061,10 @@ def main():
         node_args = sys.argv[2:]
         show_virtual = "--virtual" in node_args
         show_provenance = "--full" in node_args
-        node_args = [a for a in node_args if a not in ("--virtual", "--full")]
+        show_all = "--all" in node_args
+        if show_all:
+            show_virtual = True
+        node_args = [a for a in node_args if a not in ("--virtual", "--full", "--all")]
         limit = None
         if "--limit" in node_args:
             idx = node_args.index("--limit")
@@ -4882,7 +5078,7 @@ def main():
             cmd_node(
                 engine, node_args[0],
                 show_virtual=show_virtual, limit=limit,
-                show_provenance=show_provenance,
+                show_provenance=show_provenance, show_low_signal=show_all,
             )
     elif cmd == "ingest" and len(sys.argv) >= 3:
         args = sys.argv[2:]

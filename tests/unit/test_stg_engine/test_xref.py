@@ -315,8 +315,16 @@ class TestXRefResolveNode:
         # Node-scoped should scan fewer edges
         assert report_node.edges_scanned <= report_full.edges_scanned
         # All results should involve Bertha_Mason as target
+        # XRefResult carries normalized (lower-cased) anchor keys — the same
+        # contract TestXRefBasic/TestXRefCommunity assert against. This loop
+        # used to compare against the display name "Bertha_Mason" and passed
+        # only because report_node.results was empty: the sibling virtual
+        # edges auto-created on ingest matched every candidate as an existing
+        # neighbour, so nothing was ever produced to check. With virtual edges
+        # off by default the results are non-empty and the loop finally runs.
+        assert report_node.results, "resolve_node produced no results to check"
         for r in report_node.results:
-            assert r.target == "Bertha_Mason", (
+            assert r.target.lower() == "bertha_mason", (
                 f"resolve_node('Bertha_Mason') returned edge to {r.target}"
             )
 
