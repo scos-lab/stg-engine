@@ -728,6 +728,24 @@ def save_engine_state(
                         old_rows,
                     )
 
+            # Embeddings (written only by `stg embed`): carry them across
+            # full saves or the first ingest after an embed silently wipes the
+            # vector table and the next search falls back to re-encoding the
+            # whole graph. Stale coverage (nodes added since the embed) is
+            # handled at search time, not here.
+            if "embeddings" in old_tables:
+                _emb_rows = old_conn.execute(
+                    "SELECT node_name, embed_text, vector, model_name, created_at "
+                    "FROM embeddings"
+                ).fetchall()
+                if _emb_rows:
+                    conn.executemany(
+                        "INSERT INTO embeddings "
+                        "(node_name, embed_text, vector, model_name, created_at) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        _emb_rows,
+                    )
+
             # Telemetry tables (all append-only)
             _telemetry_tables = [
                 ("telemetry_propagations",

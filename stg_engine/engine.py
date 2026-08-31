@@ -353,6 +353,7 @@ class STGEngine:
         self._embed_model = None       # Loaded lazily on first search()
         self._vector_index = None      # VectorIndex instance
         self._embed_texts = None       # Dict[str, str] from EmbeddingBuilder
+        self._embed_store_path = None  # .stg file with persisted vectors (set by load())
         self._model_name = None        # Name of loaded model
 
         # Kanerva extensions (Phase 8)
@@ -2918,11 +2919,14 @@ class STGEngine:
             search_time_ms=elapsed,
         )
 
-    def build_search_index(self, model_name: str = None) -> int:
+    def build_search_index(self, model_name: str = None, exclude=None) -> int:
         """Build or rebuild the embedding index for all nodes.
 
         Args:
             model_name: Override default model name
+            exclude: Optional set of normalized node keys to leave out of the
+                index (e.g. bookkeeping nodes the recall layer hides — they
+                stay in the graph as records but should not occupy seed slots)
 
         Returns:
             Number of nodes indexed
@@ -2938,6 +2942,11 @@ class STGEngine:
 
         builder = EmbeddingBuilder()
         self._embed_texts = builder.build_all(self)
+        if exclude:
+            self._embed_texts = {
+                n: t for n, t in self._embed_texts.items()
+                if self._nk(n) not in exclude
+            }
 
         if not self._embed_texts:
             self._vector_index = VectorIndex()
@@ -2956,14 +2965,39 @@ class STGEngine:
         return self._vector_index.size
 
     def _ensure_search_ready(self) -> None:
-        """Load model and build index if not already done."""
+        """Load model, then hydrate the persisted index or build one."""
         if self._embed_model is None:
             from stg_engine.semantic import load_embedding_model, DEFAULT_MODEL_NAME
             self._model_name = DEFAULT_MODEL_NAME
             self._embed_model = load_embedding_model(DEFAULT_MODEL_NAME)
 
         if self._vector_index is None or self._vector_index.size == 0:
-            self._build_vector_index()
+            if not self._hydrate_vector_index():
+                self._build_vector_index()
+
+    def _hydrate_vector_index(self) -> bool:
+        """Rebuild the in-memory index from vectors persisted by `stg embed`.
+
+        The CLI runs one command per process, so without this every search
+        re-encoded the entire graph (minutes on 10k nodes) instead of reading
+        the vectors `stg embed` had already saved — the save path existed
+        since Phase 7G but nothing ever called load_embeddings. Returns False
+        when nothing usable is persisted (no store path, empty table, or a
+        model mismatch) so the caller falls back to a full build.
+        """
+        if not self._embed_store_path:
+            return False
+        from stg_engine.persistence import load_embeddings
+        from stg_engine.semantic import VectorIndex
+        data = load_embeddings(self._embed_store_path, expected_model=self._model_name)
+        if not data:
+            return False
+        vectors = data["vectors"]
+        idx = VectorIndex()
+        idx.build({name: vectors[i] for i, name in enumerate(data["names"])})
+        self._vector_index = idx
+        self._embed_texts = data["embed_texts"]
+        return True
 
     def _build_vector_index(self) -> None:
         """Build vector index from current graph state."""
@@ -3022,6 +3056,7 @@ class STGEngine:
         state = load_engine_state(path)
 
         engine = cls()
+        engine._embed_store_path = path
         _nk = cls._nk
 
         # Restore nodes — normalize keys, merge case duplicates

@@ -215,6 +215,27 @@ def _is_low_signal_edge(edge, hidden_roles) -> bool:
     return edge.modifiers.get("role") in hidden_roles
 
 
+def _low_signal_node_keys(engine) -> set:
+    """Normalized keys of nodes whose every edge is hidden bookkeeping.
+
+    A node is low-signal when it touches at least one edge and none of its
+    edges are real signal (all virtual or role-hidden) — e.g. per-item
+    Verdict: nodes. Single pass over the edge list; shared by the query node
+    filter and the embed index builder so the judgement can't fork.
+    """
+    _hr = _hidden_roles()
+    touched, has_signal = set(), set()
+    for e in engine._edges:
+        sk, tk = engine._nk(e.source), engine._nk(e.target)
+        touched.add(sk)
+        touched.add(tk)
+        if (e.modifiers.get("edge_class") != "virtual"
+                and not _is_low_signal_edge(e, _hr)):
+            has_signal.add(sk)
+            has_signal.add(tk)
+    return touched - has_signal
+
+
 def _auto_bind_enabled() -> bool:
     """Whether ingest auto-binds new nodes to same-community candidates.
 
@@ -701,17 +722,7 @@ def cmd_query(engine, pattern, limit=20, show_all=False):
     # are a health signal, not noise). One pass over the edge list.
     n_low_nodes = 0
     if not show_all:
-        _hr = _hidden_roles()
-        _touched, _has_signal = set(), set()
-        for _e in engine._edges:
-            _sk, _tk = engine._nk(_e.source), engine._nk(_e.target)
-            _touched.add(_sk)
-            _touched.add(_tk)
-            if (_e.modifiers.get("edge_class") != "virtual"
-                    and not _is_low_signal_edge(_e, _hr)):
-                _has_signal.add(_sk)
-                _has_signal.add(_tk)
-        _low_keys = _touched - _has_signal
+        _low_keys = _low_signal_node_keys(engine)
         _n_before = len(nodes_all)
         nodes_all = [n for n in nodes_all if engine._nk(n.name) not in _low_keys]
         n_low_nodes = _n_before - len(nodes_all)
@@ -3926,11 +3937,26 @@ def cmd_search(engine, query, top_k=10, propagate=True, min_similarity=0.3):
             comm_suffix = f"  [{comm}]" if comm else ""
             print(f"  {i+1:3d}. {name:40s}  score={score:.4f}{comm_suffix}")
 
+    # Staleness note: nodes ingested after the last `stg embed` have no
+    # vector and can only surface via Phase-2 propagation, not as seeds.
+    idx = engine._vector_index
+    if idx is not None and idx.size and idx.size < len(engine._nodes):
+        print(f"\n  (index covers {idx.size}/{len(engine._nodes)} nodes — "
+              f"run `stg embed` to refresh)")
+
 
 def cmd_embed(engine, model_name=None):
-    """Build or rebuild the embedding index for all nodes."""
+    """Build or rebuild the embedding index for all nodes.
+
+    Low-signal bookkeeping nodes (see recall.hide_roles) are left out of the
+    index — they stay in the graph as records but must not occupy semantic
+    seed slots the way they crowded the query listing cap.
+    """
     t0 = time.perf_counter()
-    count = engine.build_search_index(model_name=model_name)
+    exclude = _low_signal_node_keys(engine)
+    count = engine.build_search_index(model_name=model_name, exclude=exclude)
+    if exclude:
+        print(f"({len(exclude)} low-signal node(s) excluded from the index)")
     elapsed = time.perf_counter() - t0
     print(f"Embedded {count} nodes ({elapsed:.1f}s)")
     print(f"Model: {engine._model_name}")
