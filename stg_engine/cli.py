@@ -78,6 +78,9 @@ Direct file path: use --path <file.stg> to load any .stg file (overrides --agent
   telemetry [status|frequency|report]    Usage statistics
   simulate run --calibrated              Parameter simulation with real data
   backup [--keep N]                      Backup .stg file (auto-rotated)
+  pruned [--limit N] [--type T]          Pruning audit log (what was removed, why)
+  pruned purge --type T | --before DATE  Delete audit rows: dumped to ARCHIVED/*.jsonl
+         [--all] [--dry-run] [--no-vacuum]  first, then VACUUM (reversible)
   alias <add|list|remove|resolve>         Entity resolution aliases (G7)
   virtual [stats|list|rebuild]           Virtual edge management
   embed [--model NAME]                   Build/rebuild embedding index
@@ -163,6 +166,92 @@ def _write_user_config(config: dict):
     with open(_USER_CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
         f.write("\n")
+
+
+def _virtual_enabled() -> bool:
+    """Whether ingest should auto-create virtual (sibling proximity) edges.
+
+    Default False. Virtual edges were measured on the live graph 2026-08-30
+    to leave propagate's ranking unchanged (same top-1 and same ordering with
+    them purged) while accounting for 66% of all edges and burying
+    `temporal range` under clique noise. Re-enable per user with:
+
+        stg config set virtual.enabled true
+    """
+    cfg = _read_user_config()
+    section = cfg.get("virtual")
+    if isinstance(section, dict):
+        return section.get("enabled") is True
+    return False
+
+
+_DEFAULT_HIDDEN_ROLES = ("verdict", "used_in_handling")
+
+
+def _hidden_roles() -> set:
+    """Roles whose edges recall output hides by default.
+
+    These are bookkeeping records — board-item pass/fail verdicts, "tool was
+    used while handling X" traces — worth keeping as records but burying the
+    semantic content when rendered (measured 2026-08-30: ~65% of a week's
+    knowledge edges were such records, all with empty descriptions). They are
+    never deleted and never excluded from activation dynamics — this is a
+    display-layer filter only, bypassed per command with --all. Tune with:
+
+        stg config set recall.hide_roles "verdict,used_in_handling"
+
+    An explicit empty value ("") disables hiding entirely.
+    """
+    cfg = _read_user_config()
+    section = cfg.get("recall")
+    if isinstance(section, dict) and "hide_roles" in section:
+        v = section["hide_roles"]
+        if isinstance(v, list):
+            return {str(x) for x in v}
+        if isinstance(v, str):
+            return {x.strip() for x in v.split(",") if x.strip()}
+    return set(_DEFAULT_HIDDEN_ROLES)
+
+
+def _is_low_signal_edge(edge, hidden_roles) -> bool:
+    """True when the edge is a bookkeeping record hidden from recall output."""
+    return edge.modifiers.get("role") in hidden_roles
+
+
+def _low_signal_node_keys(engine) -> set:
+    """Normalized keys of nodes whose every edge is hidden bookkeeping.
+
+    A node is low-signal when it touches at least one edge and none of its
+    edges are real signal (all virtual or role-hidden) — e.g. per-item
+    Verdict: nodes. Single pass over the edge list; shared by the query node
+    filter and the embed index builder so the judgement can't fork.
+    """
+    _hr = _hidden_roles()
+    touched, has_signal = set(), set()
+    for e in engine._edges:
+        sk, tk = engine._nk(e.source), engine._nk(e.target)
+        touched.add(sk)
+        touched.add(tk)
+        if (e.modifiers.get("edge_class") != "virtual"
+                and not _is_low_signal_edge(e, _hr)):
+            has_signal.add(sk)
+            has_signal.add(tk)
+    return touched - has_signal
+
+
+def _auto_bind_enabled() -> bool:
+    """Whether ingest auto-binds new nodes to same-community candidates.
+
+    Default False — the documented workflow is ingest → review candidates →
+    explicit `stg bind`. Auto-bind guesses up to 5 context edges per new node
+    from a propagate over the node name; measured retrieval value ≈ 0
+    (2026-08-30 A/B). Re-enable with: stg config set bind.auto_enabled true
+    """
+    cfg = _read_user_config()
+    section = cfg.get("bind")
+    if isinstance(section, dict):
+        return section.get("auto_enabled") is True
+    return False
 
 
 def _load_settings():
@@ -258,6 +347,95 @@ def _audit_log(cmd, args, before, after=None, detail=""):
     _audit.info(msg)
 
 
+# ═══════════════════════════════════════════════════════════
+# Write-lock support (F1/F4) — see interlock.py for the full rationale.
+# ═══════════════════════════════════════════════════════════
+from stg_engine import interlock
+
+_LOCK_TIMEOUT_S = 15.0
+
+# Commands whose handler performs a whole-graph engine.save (the F1/F4 lost-
+# update target) hold an exclusive interprocess lock for their whole run.
+# 'feedback' is included because it writes the .stg incrementally
+# (active_context) even without an engine.save. EVERY other command — reads,
+# plus incremental-only or long-running writers such as use / simulate / embed /
+# perceive — takes NO lock: reads are consistent via SQLite + save's atomic
+# rename, and locking a long command would starve real writers.
+_LOCK_WRITE_CMDS = frozenset({
+    "import-doc", "propagate", "select", "ingest", "bind", "alias",
+    "ingest-file", "merge", "consolidate", "xref", "virtual", "learn",
+    "prune", "topology", "cognitive", "reload", "import", "preference",
+    "coactivation", "temporal", "feedback",
+})
+
+# Optimistic-concurrency baseline captured at load; guards against a
+# non-cooperating writer that bypassed the lock (see _cli_save).
+_load_baseline = {"mtime_ns": None, "nodes": None, "edges": None}
+
+
+def _mtime_ns(path):
+    try:
+        return os.stat(path).st_mtime_ns
+    except OSError:
+        return None
+
+
+def _note_loaded_baseline(engine):
+    """Record the on-disk state we loaded from, for the _cli_save guard."""
+    _load_baseline["mtime_ns"] = _mtime_ns(STG_PATH)
+    _load_baseline["nodes"] = len(engine._nodes)
+    _load_baseline["edges"] = len(engine._edges)
+
+
+def _disk_graph_counts(path):
+    """(node_count, edge_count) straight from the .stg, or (None, None)."""
+    import sqlite3
+    try:
+        conn = sqlite3.connect(path)
+        try:
+            n = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+            e = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+            return n, e
+        finally:
+            conn.close()
+    except Exception:
+        return None, None
+
+
+def _cli_save(engine):
+    """CLI-layer save: optimistic external-modification guard, then save.
+
+    The exclusive interprocess lock already serializes cooperating `stg`
+    writers. This adds a belt-and-braces guard against a NON-cooperating writer
+    (one that bypassed the lock) that rewrote the whole graph between our load
+    and our save. It distinguishes our own incremental side-writes
+    (telemetry.flush / active_context — which bump the file mtime but not the
+    node/edge counts) from a real external graph rewrite via a cheap count
+    check, so it never false-positives on e.g. propagate's own telemetry flush.
+    """
+    base_mtime = _load_baseline["mtime_ns"]
+    if base_mtime is not None:
+        cur_mtime = _mtime_ns(STG_PATH)
+        if cur_mtime is not None and cur_mtime != base_mtime:
+            dn, de = _disk_graph_counts(STG_PATH)
+            if dn is not None and (dn, de) != (
+                _load_baseline["nodes"], _load_baseline["edges"]
+            ):
+                print(
+                    f"error: {STG_PATH} changed on disk since it was loaded "
+                    f"(nodes/edges {(_load_baseline['nodes'], _load_baseline['edges'])}"
+                    f" -> {(dn, de)}).\nRefusing to save to avoid clobbering "
+                    f"another writer's changes. Re-run to pick up the new state.",
+                    file=sys.stderr,
+                )
+                sys.exit(3)
+    engine.save(STG_PATH)
+    # Advance the baseline past our own write.
+    _load_baseline["mtime_ns"] = _mtime_ns(STG_PATH)
+    _load_baseline["nodes"] = len(engine._nodes)
+    _load_baseline["edges"] = len(engine._edges)
+
+
 def load_engine():
     from stg_engine import STGEngine
     if os.path.exists(STG_PATH):
@@ -265,9 +443,110 @@ def load_engine():
     # First use: create empty graph and parent directories
     os.makedirs(os.path.dirname(STG_PATH), exist_ok=True)
     engine = STGEngine()
-    engine.save(STG_PATH)
+    _cli_save(engine)
     print(f"Created new STG: {STG_PATH}")
     return engine
+
+
+def _doctor_report(engine, since_ts=None, sample=5):
+    """Graph hygiene (SKC kernel line 2026-08-23, absentia advice §4): islands are a hygiene defect, not something
+    to discover in a bench. Real edges only — virtual (xref) edges carry no activation, so they must not make the
+    graph look more connected than it is. Returns a dict; `stg doctor` renders it."""
+    import networkx as nx
+    from stg_engine.engine import SEMANTIC_FIELDS
+    nk = engine._nk
+    R = nx.Graph()
+    R.add_nodes_from(engine._nodes.keys())
+    deg = {k: 0 for k in engine._nodes}
+    vdeg = {k: 0 for k in engine._nodes}
+    first_real = {}
+    shell_edges = []
+    for e in engine._edges:
+        m = e.modifiers or {}
+        s, t = nk(e.source), nk(e.target)
+        if m.get("edge_class") == "virtual":
+            vdeg[s] = vdeg.get(s, 0) + 1; vdeg[t] = vdeg.get(t, 0) + 1
+            continue
+        deg[s] = deg.get(s, 0) + 1; deg[t] = deg.get(t, 0) + 1
+        if s != t:
+            R.add_edge(s, t)
+        try:
+            ts = float(e.created_at or 0)
+        except Exception:
+            ts = 0.0
+        for x in (s, t):
+            if ts and (x not in first_real or ts < first_real[x]):
+                first_real[x] = ts
+        if not any(m.get(f) for f in SEMANTIC_FIELDS) and not e.is_intrinsic_property():
+            shell_edges.append(e)
+    comps = sorted(nx.connected_components(R), key=len, reverse=True)
+    n = len(engine._nodes)
+    zero = [k for k in engine._nodes if deg.get(k, 0) == 0 and vdeg.get(k, 0) == 0]
+    virtual_only = [k for k in engine._nodes if deg.get(k, 0) == 0 and vdeg.get(k, 0) > 0]
+    sizes = [len(c) for c in comps]
+    hist = {}
+    for sz in sizes:
+        b = "1" if sz == 1 else "2-9" if sz < 10 else "10-99" if sz < 100 else "100+"
+        hist[b] = hist.get(b, 0) + 1
+    new_islands = []
+    if since_ts is not None:
+        old = {k for k, ts in first_real.items() if ts < since_ts}
+        for c in comps:
+            if len(c) and not (c & old) and any(first_real.get(k, 0) >= since_ts for k in c):
+                new_islands.append(sorted(c)[:3])
+    return {
+        "nodes": n, "real_edges": sum(deg.values()) // 2, "components": len(comps),
+        "largest": sizes[0] if sizes else 0, "largest_share": (sizes[0] / n) if n else 0.0, "size_hist": hist,
+        "zero_degree": zero, "virtual_only": virtual_only, "shell_edges": shell_edges, "new_islands": new_islands,
+    }
+
+
+def cmd_doctor(engine, since=None, sample=5):
+    """`stg doctor [--since ISO]` — graph hygiene report; exit 2 when something needs attention."""
+    since_ts = None
+    if since:
+        from datetime import datetime as _dt
+        try:
+            since_ts = _dt.fromisoformat(since).timestamp()
+        except ValueError:
+            try:
+                since_ts = float(since)
+            except ValueError:
+                print(f"bad --since {since!r} (ISO8601 or epoch)"); return 1
+    r = _doctor_report(engine, since_ts, sample)
+    dn = engine._dn
+    print(f"stg doctor · {r['nodes']} nodes · {r['real_edges']} real edges")
+    print(f"  components (real edges): {r['components']}  largest {r['largest']} ({r['largest_share']*100:.1f}%)  sizes {r['size_hist']}")
+    print(f"  zero-degree nodes: {len(r['zero_degree'])}" + (f"  e.g. {[dn(k) for k in r['zero_degree'][:sample]]}" if r['zero_degree'] else ""))
+    print(f"  virtual-only nodes (no real edge): {len(r['virtual_only'])}" + (f"  e.g. {[dn(k) for k in r['virtual_only'][:sample]]}" if r['virtual_only'] else ""))
+    print(f"  shell edges (no meta semantic field): {len(r['shell_edges'])}" + (f"  e.g. {[f'{e.source}->{e.target}' for e in r['shell_edges'][:sample]]}" if r['shell_edges'] else ""))
+    if since_ts is not None:
+        print(f"  new islands since {since}: {len(r['new_islands'])}" + (f"  e.g. {[[dn(k) for k in c] for c in r['new_islands'][:sample]]}" if r['new_islands'] else ""))
+    flagged = bool(r['zero_degree'] or r['virtual_only'] or r['new_islands'])
+    if flagged:
+        print("  → islands: bind them (`stg bind`, or ingest an edge to an existing node); zero-degree/virtual-only nodes are usually residue of renamed anchors")
+    return 2 if flagged else 0
+
+
+def _island_warning(engine, new_node_keys):
+    """After an ingest: warn when a newly created node has no real-edge path to a pre-existing node."""
+    if not new_node_keys:
+        return
+    import networkx as nx
+    nk = engine._nk
+    R = nx.Graph()
+    R.add_nodes_from(engine._nodes.keys())
+    for e in engine._edges:
+        if (e.modifiers or {}).get("edge_class") == "virtual":
+            continue
+        R.add_edge(nk(e.source), nk(e.target))
+    new = set(new_node_keys)
+    for k in new:
+        comp = nx.node_connected_component(R, k) if k in R else {k}
+        if not (comp - new):
+            print(f"⚠ island: new node(s) {sorted(engine._dn(x) for x in comp)} connect to nothing that existed before — "
+                  f"bind them (stg bind / an edge to an existing node) or recall will never reach them")
+            break
 
 
 def cmd_stats(engine):
@@ -355,7 +634,7 @@ def cmd_import_doc(engine, filepath, source_type="doc", max_desc=10000):
         source_type=source_type,
         timestamp=ts,
     )
-    engine.save(STG_PATH)
+    _cli_save(engine)
     print(f"Imported: [{node_name}] -> [{content_node}] ({len(text)} chars)")
     s = engine.get_stats()
     print(f"Graph: {s['node_count']} nodes, {s['edge_count']} edges")
@@ -416,7 +695,7 @@ def cmd_grep(engine, pattern, limit=20, full=False):
             print(f"    {desc}")
 
 
-def cmd_query(engine, pattern, limit=20):
+def cmd_query(engine, pattern, limit=20, show_all=False):
     """Fuzzy node search with optional namespace scoping.
 
     Pattern grammar:
@@ -433,17 +712,31 @@ def cmd_query(engine, pattern, limit=20):
         namespace = None
         name_pattern = pattern
 
-    nodes = engine.query_nodes(
-        name_pattern=name_pattern, namespace=namespace, limit=limit,
+    nodes_all = engine.query_nodes(
+        name_pattern=name_pattern, namespace=namespace, limit=10000,
     )
-    if not nodes:
+    if not nodes_all:
         print(f"No nodes matching '{pattern}'")
         return
-    total = len(engine.query_nodes(
-        name_pattern=name_pattern, namespace=namespace, limit=10000,
-    ))
+    # Node-level recall filter: a node whose every edge is a hidden
+    # bookkeeping record (or virtual) is itself a bookkeeping record — e.g.
+    # per-item Verdict: nodes, which otherwise crowd the listing cap and push
+    # real hits out of view. Nodes with no edges at all stay visible (islands
+    # are a health signal, not noise). One pass over the edge list.
+    n_low_nodes = 0
+    if not show_all:
+        _low_keys = _low_signal_node_keys(engine)
+        _n_before = len(nodes_all)
+        nodes_all = [n for n in nodes_all if engine._nk(n.name) not in _low_keys]
+        n_low_nodes = _n_before - len(nodes_all)
+    total = len(nodes_all)
+    nodes = nodes_all[:limit]
     shown = len(nodes)
     suffix = f" (showing {shown}/{total})" if total > shown else ""
+    if not nodes:
+        print(f"No nodes matching '{pattern}' "
+              f"({n_low_nodes} low-signal node(s) hidden, use --all to show)")
+        return
     print(f"Nodes matching '{pattern}'{suffix}:")
     for n in nodes:
         display = f"{n.namespace}:{n.name}" if n.namespace else n.name
@@ -456,6 +749,8 @@ def cmd_query(engine, pattern, limit=20):
         if comm:
             parts.append(f"[{comm}]")
         print(" | ".join(parts))
+    if n_low_nodes:
+        print(f"  (+ {n_low_nodes} low-signal node(s) hidden, use --all to show)")
 
     # Helper: namespace-prefixed display name for edge endpoints
     def _ns_label(name: str) -> str:
@@ -484,6 +779,12 @@ def cmd_query(engine, pattern, limit=20):
                     and node.namespace.lower() == ns_lower
                 )
             related = [e for e in related if _in_ns(e.source) or _in_ns(e.target)]
+        n_low = 0
+        if related and not show_all:
+            _hr = _hidden_roles()
+            n_before = len(related)
+            related = [e for e in related if not _is_low_signal_edge(e, _hr)]
+            n_low = n_before - len(related)
         if related:
             print(f"\nRelated edges ({len(related)}):")
             for e in related[:10]:
@@ -499,6 +800,8 @@ def cmd_query(engine, pattern, limit=20):
                 mod_lines, _ = _format_edge_modifiers(e, indent="    ")
                 for line in mod_lines:
                     print(line)
+        if n_low:
+            print(f"  (+ {n_low} low-signal record(s) hidden, use --all to show)")
 
 
 def cmd_dump(engine, page_size=100, start=0, namespace=None):
@@ -857,7 +1160,7 @@ def _community_label(engine, node_name, resolution="medium"):
         return ""
 
 
-def cmd_propagate(engine, text, use_gravity=False, resolution="medium", all_chains=False, all_modifiers=False, expand_top=3, community_mode=True, top_m=5, brief=False, show_virtual=False,
+def cmd_propagate(engine, text, use_gravity=False, resolution="medium", all_chains=False, all_modifiers=False, expand_top=3, community_mode=True, top_m=5, brief=False, show_virtual=False, show_low_signal=False,
                   no_recency_weight=False, no_community_filter=False,
                   no_context_anchor=False, no_multi_seed=False,
                   no_edge_fallback=False):
@@ -1138,7 +1441,7 @@ def cmd_propagate(engine, text, use_gravity=False, resolution="medium", all_chai
                 # Inline full node detail — edges, modifiers, descriptions.
                 # Skip for reps that weren't reached (no activation) to save tokens.
                 if not brief and rep.activation > 0:
-                    _render_node_detail(engine, rep.node_name, indent="      ", show_virtual=show_virtual)
+                    _render_node_detail(engine, rep.node_name, indent="      ", show_virtual=show_virtual, show_low_signal=show_low_signal)
             # Query-matching nodes inside community that aren't top reps.
             # These are the precise hits that would vanish at the community level.
             if comm.query_seeds:
@@ -1147,7 +1450,7 @@ def cmd_propagate(engine, text, use_gravity=False, resolution="medium", all_chai
                     print(f"    [{c_idx}.s{s_idx}] {seed.node_name}  "
                           f"act={seed.activation:.3f}  elev={seed.elevation:.3f}")
                     if not brief and seed.activation > 0:
-                        _render_node_detail(engine, seed.node_name, indent="      ", show_virtual=show_virtual)
+                        _render_node_detail(engine, seed.node_name, indent="      ", show_virtual=show_virtual, show_low_signal=show_low_signal)
     else:
         print(f"propagate('{text}') → {len(activated)} nodes ({elapsed*1000:.1f}ms){gravity_label}:")
         for idx, name in enumerate(activated, 1):
@@ -1190,8 +1493,13 @@ def cmd_propagate(engine, text, use_gravity=False, resolution="medium", all_chai
     # node result (= both topic-matched and fact-matched, highest priority).
     if edge_hits_data:
         activated_lower = {n.lower() for n in activated} if activated else set()
-        print(f"\n🪢 Event-edge matches ({len(edge_hits_data)}):")
-        for edge, matched, score in edge_hits_data:
+        eh_shown = edge_hits_data
+        if not show_low_signal:
+            _hr = _hidden_roles()
+            eh_shown = [t for t in edge_hits_data if not _is_low_signal_edge(t[0], _hr)]
+        eh_hidden = len(edge_hits_data) - len(eh_shown)
+        print(f"\n🪢 Event-edge matches ({len(eh_shown)}):")
+        for edge, matched, score in eh_shown:
             label = _format_edge_label(edge)
             double_hit = (edge.source.lower() in activated_lower) or (edge.target.lower() in activated_lower)
             mark = "  🔗 双重命中" if double_hit else ""
@@ -1201,6 +1509,8 @@ def cmd_propagate(engine, text, use_gravity=False, resolution="medium", all_chai
                 desc_short = desc if len(desc) <= 120 else desc[:117] + "..."
                 print(f"     {desc_short}")
             print(f"     matched: {', '.join(matched)}")
+        if eh_hidden:
+            print(f"  (+ {eh_hidden} low-signal edge match(es) hidden, use --all to show)")
 
     # Show learning summary
     log = engine.learning_log
@@ -1221,7 +1531,7 @@ def cmd_propagate(engine, text, use_gravity=False, resolution="medium", all_chai
     # Flush telemetry + save
     if engine._telemetry:
         engine._telemetry.flush(STG_PATH)
-    engine.save(STG_PATH)
+    _cli_save(engine)
 
     # Log to propagate_log.stl.md
     _log_propagate(engine, text, elapsed)
@@ -1284,7 +1594,7 @@ def cmd_select(engine, args):
 
     # Save engine first (salience changes), then active context
     # Order matters: engine.save() may recreate tables
-    engine.save(STG_PATH)
+    _cli_save(engine)
     save_active_context(engine, result.selected_nodes, STG_PATH)
 
     print(f"Selected {len(result.selected_nodes)} node(s):")
@@ -1390,6 +1700,9 @@ def cmd_config(args):
       skill.default_timeout_s           — int, fallback timeout when Skill edge doesn't specify (default: 60)
       skill.max_timeout_s               — int, hard cap applied to any resolved timeout (default: 600)
       skill.output_cap_bytes            — int, max captured stdout (default: 10485760)
+      virtual.enabled                   — bool, auto-create sibling proximity edges on ingest (default: false)
+      bind.auto_enabled                 — bool, auto-bind new nodes to community candidates on ingest (default: false; explicit `stg bind` always works)
+      recall.hide_roles                 — list[str], edge roles hidden from recall output; --all bypasses per command (default: verdict,used_in_handling)
       feedback.session_end_hook         — str, shell-quoted command run after `feedback session-end` succeeds (default: unset). No shell invoked. Use to plug in backups, sync, etc.
       feedback.session_end_hook_timeout_s — int, max seconds the post-hook may run (default: 300)
     """
@@ -1671,7 +1984,7 @@ def _format_edge_attrs(edge) -> str:
     return f" ({', '.join(parts)})" if parts else ""
 
 
-def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None, show_provenance=False):
+def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None, show_provenance=False, show_low_signal=False):
     """Print full node detail with configurable indent.
 
     Extracted from cmd_node so community-mode propagate can inline
@@ -1729,6 +2042,14 @@ def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None,
         in_edges = [e for e in in_edges_all if not _is_virtual_edge(e)]
         out_virtual = len(out_edges_all) - len(out_edges)
         in_virtual = len(in_edges_all) - len(in_edges)
+    out_low = in_low = 0
+    if not show_low_signal:
+        _hr = _hidden_roles()
+        _n_out, _n_in = len(out_edges), len(in_edges)
+        out_edges = [e for e in out_edges if not _is_low_signal_edge(e, _hr)]
+        in_edges = [e for e in in_edges if not _is_low_signal_edge(e, _hr)]
+        out_low = _n_out - len(out_edges)
+        in_low = _n_in - len(in_edges)
     mod_indent = pfx + "      "
     out_shown = out_edges if limit is None else out_edges[:limit]
     in_shown = in_edges if limit is None else in_edges[:limit]
@@ -1752,6 +2073,8 @@ def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None,
             print(f"{pfx}    (+ {out_truncated} more outgoing edge(s) truncated, raise --limit to show)")
     if out_virtual:
         print(f"{pfx}    (+ {out_virtual} virtual edge(s) hidden, use --virtual to show)")
+    if out_low:
+        print(f"{pfx}    (+ {out_low} low-signal record(s) hidden, use --all to show)")
     if in_edges:
         header = f"\n{pfx}  Incoming ({len(in_edges)})"
         if limit is not None and len(in_edges) > limit:
@@ -1769,6 +2092,8 @@ def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None,
             print(f"{pfx}    (+ {in_truncated} more incoming edge(s) truncated, raise --limit to show)")
     if in_virtual:
         print(f"{pfx}    (+ {in_virtual} virtual edge(s) hidden, use --virtual to show)")
+    if in_low:
+        print(f"{pfx}    (+ {in_low} low-signal record(s) hidden, use --all to show)")
     if total_provenance_hidden and not show_provenance:
         plural = "field" if total_provenance_hidden == 1 else "fields"
         print(
@@ -1777,10 +2102,11 @@ def _render_node_detail(engine, name, indent="", show_virtual=False, limit=None,
         )
 
 
-def cmd_node(engine, name, show_virtual=False, limit=None, show_provenance=False):
+def cmd_node(engine, name, show_virtual=False, limit=None, show_provenance=False, show_low_signal=False):
     _render_node_detail(
         engine, name, indent="",
         show_virtual=show_virtual, limit=limit, show_provenance=show_provenance,
+        show_low_signal=show_low_signal,
     )
 
 
@@ -2105,11 +2431,11 @@ def cmd_ingest(engine, stl_text, edge_class="knowledge", no_link=False):
             return original_add_edge(*args, **kwargs)
         engine.add_edge = patched_add_edge
         try:
-            count = engine.ingest_stl(stl_text)
+            count = engine.ingest_stl(stl_text, auto_virtual=_virtual_enabled())
         finally:
             engine.add_edge = original_add_edge
     else:
-        count = engine.ingest_stl(stl_text)
+        count = engine.ingest_stl(stl_text, auto_virtual=_virtual_enabled())
 
     new_nodes = set(engine._nodes.keys()) - nodes_before
 
@@ -2122,10 +2448,11 @@ def cmd_ingest(engine, stl_text, edge_class="knowledge", no_link=False):
             print(f"  → To register alias: stg alias add <new_name> {display_name}")
         engine._last_entity_candidates = None
 
-    engine.save(STG_PATH)
+    _cli_save(engine)
     print(f"Ingested {count} edge(s) (edge_class={edge_class}). Saved to memory.stg.")
     s = engine.get_stats()
     print(f"Graph: {s['node_count']} nodes, {s['edge_count']} edges")
+    _island_warning(engine, new_nodes)
 
     if not new_nodes or no_link:
         return
@@ -2158,19 +2485,24 @@ def cmd_ingest(engine, stl_text, edge_class="knowledge", no_link=False):
             and nc_snap.get(n, {}).get("coarse") == comm_id
         ][:5]  # top 5 same-community
 
-        if same_comm:
+        # Bind edges are the sanctioned reachability mechanism (they keep new
+        # nodes out of island status), so they are real structural edges, not
+        # virtual proximity hints. Auto-bind is still opt-in — the documented
+        # workflow is ingest → review candidates → explicit `stg bind`.
+        if same_comm and _auto_bind_enabled():
             bound = 0
             for new_node in new_nodes:
                 for ctx_node in same_comm:
-                    if ctx_node != new_node and ctx_node in engine._nodes:
+                    if (engine._nk(ctx_node) != engine._nk(new_node)
+                            and engine._nk(ctx_node) in engine._nodes):
                         engine.add_edge(
                             ctx_node, new_node,
                             confidence=0.15,
-                            edge_class="virtual",
-                            virtual_reason="auto_bind",
+                            edge_class="structural",
+                            bind_reason="auto_bind",
                         )
                         bound += 1
-            engine.save(STG_PATH)
+            _cli_save(engine)
             print(f"\nAuto-bind: community={comm_id} (anchor: {anchor})")
             print(f"  Bound {len(new_nodes)} new node(s) to {len(same_comm)} candidate(s) ({bound} virtual edge(s)):")
             for name in same_comm:
@@ -2228,17 +2560,23 @@ def cmd_bind(engine, args):
     bound = 0
     for new_node in new_nodes:
         for ctx_node in selected:
-            if ctx_node != new_node and ctx_node in engine._nodes:
+            # Candidates and new_nodes carry display names; engine._nodes is
+            # keyed by normalized names. The un-normalized membership test
+            # made bind silently a no-op for any mixed-case candidate — the
+            # live graph accumulated 8 context_binding edges in months while
+            # every session ran bind as instructed.
+            if (engine._nk(ctx_node) != engine._nk(new_node)
+                    and engine._nk(ctx_node) in engine._nodes):
                 engine.add_edge(
                     ctx_node, new_node,
                     confidence=0.15,
-                    edge_class="virtual",
-                    virtual_reason="context_binding",
+                    edge_class="structural",
+                    bind_reason="context_binding",
                 )
                 bound += 1
 
-    engine.save(STG_PATH)
-    print(f"Bound {len(new_nodes)} new node(s) to {len(selected)} candidate(s) ({bound} virtual edge(s)):")
+    _cli_save(engine)
+    print(f"Bound {len(new_nodes)} new node(s) to {len(selected)} candidate(s) ({bound} structural edge(s)):")
     for name in selected:
         print(f"  → {name}")
 
@@ -2256,7 +2594,7 @@ def cmd_alias(engine, subcmd, args):
         alias_name, canonical_name = args[0], args[1]
         ok = engine.register_alias(alias_name, canonical_name)
         if ok:
-            engine.save(STG_PATH)
+            _cli_save(engine)
             resolved = engine.resolve_name(alias_name)
             print(f"Alias registered: \"{alias_name}\" → \"{resolved}\"")
         else:
@@ -2272,7 +2610,7 @@ def cmd_alias(engine, subcmd, args):
     elif subcmd == "remove" and len(args) >= 1:
         ok = engine.remove_alias(args[0])
         if ok:
-            engine.save(STG_PATH)
+            _cli_save(engine)
             print(f"Alias removed: \"{args[0]}\"")
         else:
             print(f"Alias \"{args[0]}\" not found.")
@@ -2308,11 +2646,15 @@ def cmd_ingest_file(engine, file_path, created_at=None):
     if not os.path.exists(file_path):
         print(f"File not found: {file_path}")
         return
-    count = engine.ingest_stl_file(file_path, created_at=created_at)
-    engine.save(STG_PATH)
+    nodes_before = set(engine._nodes.keys())
+    count = engine.ingest_stl_file(
+        file_path, created_at=created_at, auto_virtual=_virtual_enabled()
+    )
+    _cli_save(engine)
     print(f"Ingested {count} edge(s) from {os.path.basename(file_path)}. Saved to memory.stg.")
     s = engine.get_stats()
     print(f"Graph: {s['node_count']} nodes, {s['edge_count']} edges")
+    _island_warning(engine, set(engine._nodes.keys()) - nodes_before)
 
 
 def cmd_merge(engine, stl_text):
@@ -2367,7 +2709,7 @@ def cmd_merge(engine, stl_text):
             confidence=conf, strength=strength, rule=rule,
             **patch,
         )
-        engine.save(STG_PATH)
+        _cli_save(engine)
         fields_added = len(patch) + (1 if conf is not None else 0) + (1 if rule is not None else 0)
         print(f"Merged [{source}] -> [{target}]: {fields_added} field(s) patched")
     except KeyError:
@@ -2412,7 +2754,7 @@ def cmd_consolidate(engine, args):
                 total_errors += 1
                 print(f"  [{src}] -> [{tgt}]: SKIP ({e})")
 
-        engine.save(STG_PATH)
+        _cli_save(engine)
         s = engine.get_stats()
         print(f"\nConsolidated {total_merged} pair(s) ({total_errors} skipped)")
         print(f"Graph: {s['node_count']} nodes, {s['edge_count']} edges")
@@ -2424,7 +2766,7 @@ def cmd_consolidate(engine, args):
             if result is None:
                 print(f"[{source}] -> [{target}]: only 0-1 edges, nothing to consolidate.")
             else:
-                engine.save(STG_PATH)
+                _cli_save(engine)
                 print(f"Consolidated [{source}] -> [{target}]: {result.edges_merged} edges → 1")
                 s = engine.get_stats()
                 print(f"Graph: {s['node_count']} nodes, {s['edge_count']} edges")
@@ -2483,7 +2825,7 @@ def cmd_xref(engine, args):
                 print(f"    {marker} [{r.source}] → [{r.target}] (token: \"{r.matched_token}\", IDF: {r.idf_score:.2f})")
 
     if not dry_run and report.edges_created > 0:
-        engine.save(STG_PATH)
+        _cli_save(engine)
         s = engine.get_stats()
         print(f"\nGraph: {s['node_count']} nodes, {s['edge_count']} edges")
 
@@ -2684,13 +3026,13 @@ def _virtual_list(engine):
 
 def _virtual_clear(engine):
     count = engine.clear_virtual_edges()
-    engine.save(STG_PATH)
+    _cli_save(engine)
     print(f"Cleared {count} virtual edge(s). Saved.")
 
 
 def _virtual_rebuild(engine):
     count = engine.rebuild_virtual_edges()
-    engine.save(STG_PATH)
+    _cli_save(engine)
     print(f"Rebuilt {count} virtual edge(s). Saved.")
     vs = engine.get_virtual_edge_stats()
     if vs['reason_distribution']:
@@ -2769,7 +3111,7 @@ def cmd_learn(engine, subcmd, args):
         t0 = time.perf_counter()
         events = engine.learn_from_path(path)
         elapsed = time.perf_counter() - t0
-        engine.save(STG_PATH)
+        _cli_save(engine)
         if events:
             print(f"Strengthened {len(events)} edge(s) ({elapsed*1000:.1f}ms):")
             for ev in events:
@@ -2810,7 +3152,7 @@ def cmd_learn(engine, subcmd, args):
             print(f"\nQE={pm.query_efficiency:.3f}  RS={pm.resonance_score:.3f}  "
                   f"coverage={pm.coverage:.4f}")
 
-        engine.save(STG_PATH)
+        _cli_save(engine)
         print("Saved.")
     else:
         print("Usage: learn status | learn path <n1> <n2> ... | learn propagate <text>")
@@ -2846,7 +3188,7 @@ def cmd_prune(engine, dry_run=False, conf=0.1, days=30.0):
             if len(pruned_edges) > 10:
                 print(f"  ... and {len(pruned_edges) - 10} more")
         if events:
-            engine.save(STG_PATH)
+            _cli_save(engine)
             s = engine.get_stats()
             print(f"Graph: {s['node_count']} nodes, {s['edge_count']} edges. Saved.")
         else:
@@ -2968,6 +3310,59 @@ def cmd_telemetry(engine, subcmd, args):
         print("  learning                  Strengthen/weaken ratio analysis")
         print("  calibrate                 Generate calibrated query set")
         print("  report                    Comprehensive telemetry report")
+
+
+def cmd_pruned_purge(args):
+    """`stg pruned purge` — delete pruning audit rows (dumped to JSONL first)."""
+    from stg_engine.persistence import purge_pruned_log
+
+    item_type = None
+    before = None
+    dry_run = "--dry-run" in args
+    vacuum = "--no-vacuum" not in args
+    everything = "--all" in args
+    if "--type" in args:
+        idx = args.index("--type")
+        if idx + 1 < len(args):
+            item_type = args[idx + 1]
+    if "--before" in args:
+        idx = args.index("--before")
+        if idx + 1 < len(args):
+            raw = args[idx + 1]
+            try:
+                before = datetime.strptime(raw, "%Y-%m-%d").timestamp()
+            except ValueError:
+                print(f"--before expects YYYY-MM-DD, got {raw!r}")
+                sys.exit(2)
+    if not (item_type or before is not None or everything):
+        print("pruned purge: refusing to delete everything without --all "
+              "(use --type <T> and/or --before <YYYY-MM-DD>, or --all).")
+        sys.exit(2)
+
+    # Direct file mutation outside save(): take the same write lock writers use.
+    if not dry_run:
+        interlock.hold_stg_lock(STG_PATH, timeout=_LOCK_TIMEOUT_S)
+
+    r = purge_pruned_log(STG_PATH, item_type=item_type, before=before,
+                         dry_run=dry_run, vacuum=vacuum)
+    scope = []
+    if item_type:
+        scope.append(f"type={item_type}")
+    if before is not None:
+        scope.append(f"before={datetime.fromtimestamp(before):%Y-%m-%d}")
+    scope_s = " ".join(scope) if scope else "ALL rows"
+    if dry_run:
+        print(f"pruned purge (dry-run): {r['matched']} row(s) match [{scope_s}]; "
+              f"file {r['bytes_before'] / 1e6:.1f} MB. Nothing deleted.")
+        return
+    if r["matched"] == 0:
+        print(f"pruned purge: no rows match [{scope_s}]; nothing to do.")
+        return
+    print(f"pruned purge: deleted {r['deleted']} row(s) [{scope_s}]")
+    print(f"  dump (reversible): {r['dump_path']}")
+    print(f"  file: {r['bytes_before'] / 1e6:.1f} MB → {r['bytes_after'] / 1e6:.1f} MB"
+          f"{'' if vacuum else ' (no VACUUM: space reclaimed on next VACUUM)'}")
+    _audit.info(f"CMD=pruned purge | {scope_s} | deleted={r['deleted']} | dump={r['dump_path']}")
 
 
 def cmd_pruned(limit=50, item_type=None):
@@ -3203,7 +3598,7 @@ def cmd_topology(engine, subcmd, args):
             print(f"Redundant removed: {report.redundant_count}")
         print(f"Before: {report.node_count} nodes, {report.edge_count} edges")
 
-        engine.save(STG_PATH)
+        _cli_save(engine)
         s = engine.get_stats()
         print(f"After:  {s['node_count']} nodes, {s['edge_count']} edges. Saved.")
 
@@ -3285,7 +3680,7 @@ def cmd_cognitive(engine, subcmd, args):
             gen = HypothesisGenerator()
             created = gen.apply_hypotheses(engine, hypotheses)
             print(f"\nApplied: {created} edges created")
-            engine.save(STG_PATH)
+            _cli_save(engine)
             print("Saved to .stg")
         elif hypotheses and not apply_flag:
             print("\nUse --apply to commit as edges.")
@@ -3598,11 +3993,26 @@ def cmd_search(engine, query, top_k=10, propagate=True, min_similarity=0.3):
             comm_suffix = f"  [{comm}]" if comm else ""
             print(f"  {i+1:3d}. {name:40s}  score={score:.4f}{comm_suffix}")
 
+    # Staleness note: nodes ingested after the last `stg embed` have no
+    # vector and can only surface via Phase-2 propagation, not as seeds.
+    idx = engine._vector_index
+    if idx is not None and idx.size and idx.size < len(engine._nodes):
+        print(f"\n  (index covers {idx.size}/{len(engine._nodes)} nodes — "
+              f"run `stg embed` to refresh)")
+
 
 def cmd_embed(engine, model_name=None):
-    """Build or rebuild the embedding index for all nodes."""
+    """Build or rebuild the embedding index for all nodes.
+
+    Low-signal bookkeeping nodes (see recall.hide_roles) are left out of the
+    index — they stay in the graph as records but must not occupy semantic
+    seed slots the way they crowded the query listing cap.
+    """
     t0 = time.perf_counter()
-    count = engine.build_search_index(model_name=model_name)
+    exclude = _low_signal_node_keys(engine)
+    count = engine.build_search_index(model_name=model_name, exclude=exclude)
+    if exclude:
+        print(f"({len(exclude)} low-signal node(s) excluded from the index)")
     elapsed = time.perf_counter() - t0
     print(f"Embedded {count} nodes ({elapsed:.1f}s)")
     print(f"Model: {engine._model_name}")
@@ -3625,7 +4035,7 @@ def cmd_reload():
     engine = import_memory_matrix(MATRIX_PATH)
     engine.compute_all_tensions()
     engine.compute_activations()
-    engine.save(STG_PATH)
+    _cli_save(engine)
     s = engine.get_stats()
     print(f"Reloaded from memoryMatrix.md → memory.stg")
     print(f"Graph: {s['node_count']} nodes, {s['edge_count']} edges")
@@ -3645,7 +4055,7 @@ def cmd_import(manifest_path=None):
     engine = import_knowledge_base(manifest, project_root=project_root)
     elapsed = time.perf_counter() - t0
 
-    engine.save(STG_PATH)
+    _cli_save(engine)
     s = engine.get_stats()
 
     print(f"Knowledge base imported → memory.stg ({elapsed:.1f}s)")
@@ -3715,12 +4125,12 @@ def cmd_preference(engine, subcmd, args):
                 path.append(args[i])
                 i += 1
         updated = pf.reward_path(engine, path, reward=reward)
-        engine.save(STG_PATH)
+        _cli_save(engine)
         print(f"Rewarded {updated} edge(s) along path: {' -> '.join(path)}")
 
     elif subcmd == "decay":
         affected = pf.decay_preferences(engine)
-        engine.save(STG_PATH)
+        _cli_save(engine)
         print(f"Decayed {affected} edge(s) with non-zero preference.")
 
     else:
@@ -3768,7 +4178,7 @@ def cmd_coactivation(engine, subcmd, args):
             edges_created=len(events),
             candidates_detail=candidates,
         )
-        engine.save(STG_PATH)
+        _cli_save(engine)
         print(f"Created {len(events)} co-activation edge(s). Saved.")
         for ev in events:
             print(f"  {ev.source} → {ev.target} (conf={ev.new_confidence:.2f})")
@@ -3838,6 +4248,9 @@ def cmd_temporal(engine, subcmd, args):
         epoch_to_str, parse_date_str,
     )
 
+    show_all = "--all" in args
+    args = [a for a in args if a != "--all"]
+
     if subcmd == "range":
         if len(args) < 2:
             print("Usage: temporal range <start_date> <end_date>")
@@ -3860,10 +4273,48 @@ def cmd_temporal(engine, subcmd, args):
                 edge_class = args[idx + 1]
 
         edges = query_time_range(engine, start, end, edge_class=edge_class)
+        # Recall filter: virtual clique edges and low-signal bookkeeping
+        # records (verdicts, tool traces) are hidden by default so this view
+        # answers "what happened" instead of scrolling pass/fail markers.
+        # An explicit --class means the caller asked for exactly that slice;
+        # --all shows everything raw.
+        hidden_low, hidden_virtual = [], 0
+        shown = edges
+        if not show_all and edge_class is None:
+            _hr = _hidden_roles()
+            shown = []
+            for e in edges:
+                if e.edge_class == "virtual" or e.modifiers.get("edge_class") == "virtual":
+                    hidden_virtual += 1
+                elif _is_low_signal_edge(e, _hr):
+                    hidden_low.append(e)
+                else:
+                    shown.append(e)
         print(f"Edges created between {args[0]} and {args[1]}: {len(edges)}")
-        for e in edges[:50]:
+        for e in shown[:50]:
             cls_tag = f" [{e.edge_class}]" if e.edge_class != "knowledge" else ""
-            print(f"  {epoch_to_str(e.created_at)}  [{e.source}] → [{e.target}]{cls_tag}")
+            line = f"  {epoch_to_str(e.created_at)}  [{e.source}] → [{e.target}]{cls_tag}"
+            desc = e.modifiers.get("description") or e.modifiers.get("lesson") or ""
+            if desc:
+                desc = desc if len(desc) <= 80 else desc[:77] + "..."
+                line += f"  | {desc}"
+            print(line)
+        if len(shown) > 50:
+            print(f"  (+ {len(shown) - 50} more edge(s) truncated)")
+        if hidden_low:
+            # Roll hidden records up per work unit: verdicts point item→board
+            # so the board (target) is the unit; other records group by source.
+            per_unit = {}
+            for e in hidden_low:
+                key = e.target if e.modifiers.get("role") == "verdict" else e.source
+                per_unit[key] = per_unit.get(key, 0) + 1
+            top = sorted(per_unit.items(), key=lambda kv: -kv[1])
+            roll = ", ".join(f"{k} ×{n}" for k, n in top[:12])
+            more = f" (+{len(top) - 12} more)" if len(top) > 12 else ""
+            print(f"  ({len(hidden_low)} low-signal record(s) hidden, use --all to show):")
+            print(f"    {roll}{more}")
+        if hidden_virtual:
+            print(f"  ({hidden_virtual} virtual edge(s) hidden, use --all to show)")
 
     elif subcmd == "around":
         if not args:
@@ -3877,7 +4328,16 @@ def cmd_temporal(engine, subcmd, args):
             except ValueError:
                 pass
         edges = query_temporal_neighborhood(engine, node, window_seconds=window_hours * 3600)
-        print(f"Edges within ±{window_hours}h of '{node}': {len(edges)}")
+        n_total = len(edges)
+        if not show_all:
+            _hr = _hidden_roles()
+            edges = [
+                e for e in edges
+                if e.modifiers.get("edge_class") != "virtual"
+                and not _is_low_signal_edge(e, _hr)
+            ]
+        print(f"Edges within ±{window_hours}h of '{node}': {len(edges)}"
+              + (f" ({n_total - len(edges)} hidden, use --all to show)" if n_total > len(edges) else ""))
         for e in edges[:50]:
             marker = " ◄" if e.source == node or e.target == node else ""
             print(f"  {epoch_to_str(e.created_at)}  [{e.source}] → [{e.target}]{marker}")
@@ -3931,7 +4391,7 @@ def cmd_temporal(engine, subcmd, args):
         for e in edges:
             print(f"  [{e.source}] →(k={e.delay_k}) [{e.target}]")
         if edges:
-            engine.save(STG_PATH)
+            _cli_save(engine)
             print("Saved.")
 
     elif subcmd == "stats":
@@ -4445,12 +4905,54 @@ def cmd_skill_propagate_catalog(engine, query: str):
     print(skill_runner.render_catalog(skills))
 
 
+def _print_cmd_help(cmd: str) -> None:
+    """Print the docstring entries for one command (plus continuation lines)."""
+    lines = (__doc__ or "").splitlines()
+    out = []
+    grab = False
+    for line in lines:
+        stripped = line.strip()
+        if re.match(rf"^  {re.escape(cmd)}(\s|$)", line):
+            out.append(line)
+            grab = True
+            continue
+        if grab and line.startswith("      ") and stripped and not re.match(r"^  \S", line):
+            out.append(line)          # continuation (indented deeper than a command)
+            continue
+        grab = False
+    if out:
+        print(f"stg {cmd} — usage:")
+        print("\n".join(out))
+    else:
+        print(f"No help entry for '{cmd}'. Run `stg --help` for the command list "
+              f"or `stg guide` for the full guide.")
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(1)
 
     cmd = sys.argv[1]
+
+    # `stg <cmd> --help` / `-h` prints that command's help entry and exits
+    # BEFORE the lock, the engine load and — for learning commands — the save.
+    # (Previously `stg propagate --help` ran a propagate on the word "help"
+    # and wrote the graph; audit.log had 18 such saves.)
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    if any(a in ("-h", "--help") for a in sys.argv[2:]):
+        _print_cmd_help(cmd)
+        return
+
+    # Interprocess write lock (F1/F4): whole-graph writers serialize on
+    # <stg>.lock, held from here to process exit so it spans load->mutate->save.
+    # Reads and incremental-only / long-running commands take no lock. This
+    # covers the early-return write commands (reload/import) below as well as
+    # the main dispatch. See interlock.py.
+    if cmd in _LOCK_WRITE_CMDS:
+        interlock.hold_stg_lock(STG_PATH, timeout=_LOCK_TIMEOUT_S)
 
     if cmd == "reload":
         _audit.info(f"CMD=reload | args={sys.argv[2:]} | FULL RELOAD (pre-engine)")
@@ -4471,12 +4973,19 @@ def main():
     t0 = time.perf_counter()
     engine = load_engine()
     load_ms = (time.perf_counter() - t0) * 1000
+    _note_loaded_baseline(engine)  # optimistic-concurrency baseline (see _cli_save)
 
     # --- Audit: snapshot before ---
     _before = _snap(engine)
 
     if cmd == "stats":
         cmd_stats(engine)
+    elif cmd == "doctor":
+        since = None
+        if "--since" in sys.argv:
+            i = sys.argv.index("--since")
+            since = sys.argv[i + 1] if i + 1 < len(sys.argv) else None
+        sys.exit(cmd_doctor(engine, since=since))
     elif cmd == "psi":
         cmd_psi(engine)
     elif cmd == "import-doc" and len(sys.argv) >= 3:
@@ -4540,7 +5049,10 @@ def main():
                 except ValueError:
                     pass
                 args = args[:idx] + args[idx + 2:]
-        cmd_query(engine, " ".join(args), limit=limit)
+        show_all = "--all" in args
+        if show_all:
+            args = [a for a in args if a != "--all"]
+        cmd_query(engine, " ".join(args), limit=limit, show_all=show_all)
     elif cmd == "tensions":
         status = sys.argv[2] if len(sys.argv) >= 3 else None
         cmd_tensions(engine, status)
@@ -4613,6 +5125,11 @@ def main():
         show_virtual = "--virtual" in args
         if show_virtual:
             args = [a for a in args if a != "--virtual"]
+        # --all reveals everything recall hides by default (virtual + low-signal)
+        show_all = "--all" in args
+        if show_all:
+            args = [a for a in args if a != "--all"]
+            show_virtual = True
         # Precision Recall escape hatches (default: postprocess ON):
         #   --no-recency-weight   disable R1 (recency × supersede soft decay)
         #   --no-community-filter disable R7 (community dominance ratio)
@@ -4641,7 +5158,7 @@ def main():
         cmd_propagate(engine, " ".join(args), use_gravity=use_gravity, resolution=resolution,
                       all_chains=all_chains, all_modifiers=all_modifiers, expand_top=expand_top,
                       community_mode=community_mode, top_m=top_m, brief=brief,
-                      show_virtual=show_virtual,
+                      show_virtual=show_virtual, show_low_signal=show_all,
                       no_recency_weight=no_recency_weight,
                       no_community_filter=no_community_filter,
                       no_context_anchor=no_context_anchor,
@@ -4660,7 +5177,10 @@ def main():
         node_args = sys.argv[2:]
         show_virtual = "--virtual" in node_args
         show_provenance = "--full" in node_args
-        node_args = [a for a in node_args if a not in ("--virtual", "--full")]
+        show_all = "--all" in node_args
+        if show_all:
+            show_virtual = True
+        node_args = [a for a in node_args if a not in ("--virtual", "--full", "--all")]
         limit = None
         if "--limit" in node_args:
             idx = node_args.index("--limit")
@@ -4674,7 +5194,7 @@ def main():
             cmd_node(
                 engine, node_args[0],
                 show_virtual=show_virtual, limit=limit,
-                show_provenance=show_provenance,
+                show_provenance=show_provenance, show_low_signal=show_all,
             )
     elif cmd == "ingest" and len(sys.argv) >= 3:
         args = sys.argv[2:]
@@ -4759,6 +5279,8 @@ def main():
                 except ValueError:
                     pass
         cmd_prune(engine, dry_run=dry_run, conf=conf, days=days)
+    elif cmd == "pruned" and len(sys.argv) >= 3 and sys.argv[2] == "purge":
+        cmd_pruned_purge(sys.argv[3:])
     elif cmd == "pruned":
         args = sys.argv[2:]
         limit = 50

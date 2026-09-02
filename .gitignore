@@ -50,3 +50,4 @@ Thumbs.db
 # Internal-only docs (drafts, bug reports, distribution plans). Stays
 # local; not part of the public release. See feedback_dev_release_file_separation.
 internal/
+ARCHIVED/

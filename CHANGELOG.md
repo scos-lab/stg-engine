@@ -6,6 +6,102 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — side tables no longer wiped by whole-graph saves
+
+`save_engine_state` rebuilds the `.stg` from engine state and used to carry
+only an explicit list of extra tables across. `skill_invocations` was not on
+that list, so every `stg use` audit row was erased by the next write command
+(`stg skill history` had been empty for months with `skill.audit.enabled`
+true); `telemetry_cooccurrence` and `perception_*` were dropped outright. The
+carry is now **generic**: the previous file is `ATTACH`ed and every table the
+save does not rebuild (`_REBUILT_TABLES`) is copied verbatim — schema,
+indexes and rows — with `INSERT … SELECT`. Unknown tables are recreated from
+their own `CREATE` statements; known tables copy over the intersection of
+column names, so files written by older or newer engine versions still carry.
+The SQL-level copy also replaced Python row round-trips: a full save of a
+10k-node graph with a 620k-row audit table dropped from 2.2 s to 0.8 s.
+`SAVE OK` audit lines now list what was carried (`carried: pruned_log=767,…`).
+
+### Fixed — pruning no longer logs virtual-edge churn
+
+Stale virtual (sibling / co_source) edges are regenerated and re-pruned every
+session; logging each removal wrote 619k rows into one agent's `pruned_log`
+— 86 % of a 226 MB file whose real graph was 4 MB — and every save re-copied
+them. `SynapticPruner.prune()` now removes stale virtual edges without
+logging them (`log_virtual=True` restores the old behavior). Real-edge and
+orphan-node removals are still logged.
+
+### Added — `stg pruned purge` (reversible audit-log cleanup)
+
+`stg pruned purge --type virtual_edge` / `--before YYYY-MM-DD` / `--all`
+(`--dry-run`, `--no-vacuum`) dumps the matching rows to
+`<agent dir>/ARCHIVED/pruned_log-<timestamp>.jsonl`, deletes them, then
+`VACUUM`s. Refuses to run without a scope. Holds the write lock. On the
+author's graph: 618,950 rows, 226 MB → 32 MB in 4 s; propagate end-to-end
+2.7 s → 0.8 s because propagate's learning tail saves the graph.
+`stg pruned [--limit N] [--type T]` is now documented in `--help`.
+
+### Fixed — `stg <cmd> --help` no longer runs the command
+
+`stg propagate --help` used to propagate on the word "help" — and, being a
+learning command, save the graph (18 such saves in one audit log). `-h` /
+`--help` after any command now prints that command's help entry and exits
+before the lock, the engine load and any save.
+
+### Added — Interprocess write lock (multi-session safety)
+
+Concurrent `stg` write commands no longer clobber each other. Every write
+command loads the whole graph, mutates it in memory and saves the whole graph
+back (atomic tmp+rename) — previously with **no interprocess lock**, so two
+overlapping sessions could each load the same base and the second save would
+silently overwrite the first (graph-level lost update), or collide on the temp
+file. New `stg_engine/interlock.py` provides a cross-platform advisory lock
+(POSIX `fcntl.flock`, Windows `msvcrt.locking`, stdlib only) on a sidecar
+`<stg>.lock`. Whole-graph writers take an exclusive lock for their run; reads
+take no lock (SQLite + the atomic rename already give a consistent old-or-new
+snapshot).
+
+**New user-visible behavior**: overlapping write commands serialize; a command
+that waits >15s for the lock fails with a clear "could not acquire STG write
+lock" message instead of corrupting the graph. `stg use <skill>` and read
+commands are never blocked. `STG_NO_INTERLOCK=1` disables it (recovery escape
+hatch). Library callers (HTTP server, embedded use) are intentionally not
+locked — this is a CLI-layer policy. Cross-platform note: `msvcrt` has no
+shared-lock mode, so Windows always takes an exclusive lock (we only ever take
+exclusive locks, so this is exact).
+
+### Performance — `propagate` seed matching ~17× faster
+
+`propagate` re-tokenized and morphology-checked every node on every call. It now
+builds a lazy inverted word index (word → nodes) and scans only a candidate
+superset. In-process steady-state propagate on a ~9.4k-node graph dropped from
+~62ms to ~3.5ms P50 (~17×); sparse queries are near-instant. Behavior-compatible:
+the set of recalled nodes is unchanged.
+
+### Performance — gravity map persistence
+
+The gravity map (Louvain communities + elevation, ~700–900ms to build) was
+rebuilt by every `stg` process. It is now persisted to a `gravity_cache` table
+and restored (~15ms) when the graph is unchanged (same node/edge counts), else
+rebuilt. Cold `stg propagate` drops ~1.6s → ~0.7s. The `.stg` grows ~3MB for the
+cache. Old `.stg` files without the table load normally (additive schema).
+
+### Fixed — reproducible `propagate` ordering
+
+`propagate`'s output order was non-deterministic across (and within) processes —
+equal-activation nodes inherited the Rust core's randomized HashMap iteration
+order. Added a stable secondary sort key (node name). The recalled *set* was
+always correct; only tie order was unstable. (High-hit queries retain sub-ULP
+float-summation order noise pending a Rust-core change.)
+
+### Changed — internal cleanups (no behavior change)
+
+propagate's stop-word set and morphological-suffix table are now module-level
+constants (were rebuilt per call); deduped a doubled stop word; replaced an
+`__import__("math")` with a top-level import; hoisted a `ConflictDetector`
+import. All `.stg` schema additions use `CREATE TABLE IF NOT EXISTS` and are
+backward-compatible.
+
 ### Added — Namespace-aware `stg dump` and `stg query`
 
 Namespace is now a first-class browsing primitive across both inspection
@@ -83,8 +179,9 @@ v1 surface (read-only — mutation stays on `stg` CLI):
 | `POST /v1/propagate` | shipped (commit `13a42e2`) | Activation propagation (read_only=True under the hood) |
 | `GET /v1/node/{name}` | shipped (commit `13a42e2`) | Single-node detail with incoming/outgoing edges |
 | `GET /v1/query` | shipped (commit `13a42e2`) | Fuzzy substring search + namespace filter |
-| `GET /v1/attrs/{name}` | M4 pending | Node metadata projection |
-| `GET /v1/paths` | M4 pending | Topology query between two anchors |
+| `GET /v1/paths` | shipped (M4) | Simple paths between two anchors ("how are A and B related") |
+| `GET /v1/attrs` | shipped (M4) | Metadata key universe + coverage (scope: node / namespace / graph) |
+| `GET /v1/browse` | shipped (M4) | Generic reverse-hub intersection/union with weighted ranking |
 
 Key design points:
 - **`engine.propagate(read_only=True)`** (commit `fd18059`) — HTTP path
@@ -109,8 +206,24 @@ not in `.stg`, modifiers stringified on wire, conditional CORS, static
 `.stg` with `engine_mtime` surface for clients, Pydantic v2 hard
 requirement.
 
-27 new integration tests across `tests/integration/test_server_v1_*.py`.
-E2E verified against `~/.stg/stg-steam-g8-verify` (84 nodes / 137 edges).
+40 integration tests across `tests/integration/test_server_v1_*.py`
+(27 M1–M3 + 13 M4). E2E verified against `~/.stg/stg-steam-g8-verify`
+(84 nodes / 137 edges) and the full `~/.stg/stg-steam-full` graph
+(136,977 nodes / 2.27M edges): `/v1/attrs?namespace=Game` → 61 keys,
+`/v1/browse?targets=FPS,Co_op&mode=intersection&namespace=Game` → 798
+games ranked by SteamSpy vote weight.
+
+M4 design notes:
+- **`/v1/browse` is generic, not `/v1/games`** — the engine serves
+  arbitrary agents (reddit-radar has no "games"). stg-steam's "browse
+  games by tag" is the `namespace=Game` special case. Ranking sums the
+  `weight` edge modifier (SteamSpy votes) where present, else 1.0.
+- **`/v1/attrs` is key *discovery*, not value projection** — per-node
+  attribute values already come back in `/v1/node/{name}` metadata. This
+  endpoint answers "which attributes exist in this scope?" against
+  schema-less metadata.
+- **`/v1/paths` caps `max_depth` at 8** — guards against combinatorial
+  blowup of `all_simple_paths` on the dense full graph.
 
 ### Added — `stg attrs --key` projection + `--keys` tips
 

@@ -17,11 +17,16 @@ from stg_engine.types import STGEdge, STGNode
 from stg_engine.server import engine_wrap
 from stg_engine.server.schemas import (
     ActivatedNodeOut,
+    AttrKeyOut,
+    AttrsResponse,
+    BrowseItemOut,
+    BrowseResponse,
     EdgeOut,
     HealthResponse,
     MatchOut,
     NodeDetailResponse,
     NodeOut,
+    PathsResponse,
     PropagateRequest,
     PropagateResponse,
     QueryResponse,
@@ -232,5 +237,117 @@ def query(
         namespace_filter=namespace,
         matches=matches_out,
         total_matched=total_matched,
+        truncated=truncated,
+    )
+
+
+# ─── /v1/paths (M4) ──────────────────────────────────────────────────────────
+
+
+@router.get("/paths", response_model=PathsResponse, tags=["query"])
+def paths(
+    request: Request,
+    source: str = Query(min_length=1, max_length=200),
+    target: str = Query(min_length=1, max_length=200),
+    max_depth: int = Query(default=5, ge=1, le=8,
+                           description="Max path length. Guard against combinatorial blowup on dense graphs."),
+    limit: int = Query(default=50, ge=1, le=500,
+                       description="Cap on returned paths (shortest first)."),
+) -> PathsResponse:
+    """All simple paths between two nodes — the semantic 'how are A and B related'."""
+    state = request.app.state.server_state
+    found = engine_wrap.find_paths_read_only(
+        state.engine, source, target, max_depth=max_depth
+    )
+    found.sort(key=len)
+    total = len(found)
+    truncated = total > limit
+    return PathsResponse(
+        agent=state.agent_name,
+        source=source,
+        target=target,
+        max_depth=max_depth,
+        paths=found[:limit],
+        path_count=total,
+        truncated=truncated,
+    )
+
+
+# ─── /v1/attrs (M4) ──────────────────────────────────────────────────────────
+
+
+@router.get("/attrs", response_model=AttrsResponse, tags=["query"])
+def attrs(
+    request: Request,
+    node: Optional[str] = Query(default=None, description="Scope to a single node's metadata keys."),
+    namespace: Optional[str] = Query(default=None, description="Scope to a namespace (ignored if node set)."),
+) -> AttrsResponse:
+    """Discover which metadata attributes exist — schema-less metadata key universe.
+
+    Precedence: node > namespace > whole graph. Clients call this before
+    filtering (e.g. discover that Game nodes carry price_usd, release_date_iso).
+    """
+    state = request.app.state.server_state
+    if node is not None:
+        scope = f"node:{node}"
+    elif namespace is not None:
+        scope = f"namespace:{namespace}"
+    else:
+        scope = "graph"
+    rows = engine_wrap.metadata_keys_read_only(
+        state.engine, namespace=namespace, node_name=node
+    )
+    return AttrsResponse(
+        agent=state.agent_name,
+        scope=scope,
+        keys=[AttrKeyOut(key=k, count=c, total=t) for (k, c, t) in rows],
+    )
+
+
+# ─── /v1/browse (M4) — reverse-hub intersection ──────────────────────────────
+
+
+@router.get("/browse", response_model=BrowseResponse, tags=["query"])
+def browse(
+    request: Request,
+    targets: str = Query(min_length=1, max_length=2000,
+                         description="Comma-separated anchor names, e.g. 'Tag:FPS,Tag:Co-op'."),
+    mode: str = Query(default="intersection", pattern="^(intersection|union)$"),
+    namespace: Optional[str] = Query(default=None, description="Filter results to a namespace, e.g. 'Game'."),
+    limit: int = Query(default=50, ge=1, le=500),
+) -> BrowseResponse:
+    """Catalog browse: nodes linking to a set of target anchors (generic reverse-hub).
+
+    stg-steam's 'browse games by tags' = this with namespace=Game and
+    targets=Tag:* / Genre:* / Feature:*. Results are ranked by summed edge
+    weight (SteamSpy vote counts where present) so the most relevant games
+    surface first, not alphabetical.
+    """
+    state = request.app.state.server_state
+    target_list = [t.strip() for t in targets.split(",") if t.strip()]
+    if not target_list:
+        raise HTTPException(status_code=400, detail="No valid targets supplied.")
+
+    scored = engine_wrap.reverse_intersect_read_only(
+        state.engine, target_list, mode=mode, namespace=namespace
+    )
+    total = len(scored)
+    truncated = total > limit
+    items = [
+        BrowseItemOut(
+            name=node.name,
+            namespace=node.namespace,
+            score=score,
+            matched=matched,
+        )
+        for (node, score, matched) in scored[:limit]
+    ]
+    return BrowseResponse(
+        agent=state.agent_name,
+        targets=target_list,
+        mode=mode,
+        namespace_filter=namespace,
+        items=items,
+        total_matched=total,
         truncated=truncated,
     )

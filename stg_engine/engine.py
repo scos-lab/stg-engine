@@ -8,6 +8,7 @@ Formulas execute directly on the graph. Persistence is serialization.
 """
 
 import logging
+import math
 import os
 import re
 import time as _time
@@ -113,6 +114,45 @@ def _truthy(val) -> bool:
     return str(val).strip().lower() in ("true", "1", "yes", "on")
 
 
+def _infer_rule_from_meta(modifiers: dict, has_strength: bool = False) -> Optional[str]:
+    """Infer `rule` from meta-semantic field per STL Operational Protocol §4.2.2.
+
+    Called during STL ingest when the parsed edge has no explicit `rule="..."`.
+    Returns the inferred rule name, or None if no meta-semantic field is present
+    (caller falls back to "definitional" per the §4.2.2 last row).
+
+    Inference table (matches Operational Protocol §4.2.2):
+      is_a / role / type / kind / relation / predicate  → "definitional"
+      action + (cause / effect / strength)              → "causal"
+      action + lesson                                   → "empirical"
+      action  (no companion)                            → "empirical"
+      status                                            → "empirical"
+      phase                                             → "temporal"
+      (no meta field)                                   → None (caller defaults to "definitional")
+    """
+    if not modifiers:
+        return None
+    if "action" in modifiers:
+        if has_strength or "cause" in modifiers or "effect" in modifiers:
+            return "causal"
+        if "lesson" in modifiers:
+            return "empirical"
+        return "empirical"
+    for field_name, inferred in (
+        ("is_a", "definitional"),
+        ("role", "definitional"),
+        ("type", "definitional"),
+        ("kind", "definitional"),
+        ("status", "empirical"),
+        ("phase", "temporal"),
+        ("relation", "definitional"),
+        ("predicate", "definitional"),
+    ):
+        if field_name in modifiers:
+            return inferred
+    return None
+
+
 def _get_skill_invocation(modifiers: Optional[dict]) -> dict:
     """Extract the skill invocation subset from an edge's modifiers.
 
@@ -156,12 +196,87 @@ from stg_engine.formulas import (
     compute_intrinsic_reward,
 )
 from stg_engine.persistence import save_engine_state, load_engine_state
+from stg_engine.kanerva import ConflictDetector  # safe: kanerva imports engine only under TYPE_CHECKING
 
 # ─── Hot-path core: optional Rust, pure-Python fallback ──────────
 try:
     from stg_engine import _rust_core as _rust
 except ImportError:
     from stg_engine import _core_fallback as _rust
+
+
+# ─── Propagate seed-matching helpers (F5 inverted index) ─────────
+# Precompiled once at import (previously rebuilt per-call and per-node).
+_HAS_CJK = re.compile(r'[一-鿿㐀-䶿]')
+_RE_NAME_SEP = re.compile(r'[_:\-]')
+_RE_LATIN_WORD = re.compile(r'[a-z]+|[A-Z][a-z]*|\d+')
+_RE_CJK_RUN = re.compile(r'[一-鿿㐀-䶿]+')
+
+# Known English morphological endings — a token may match a node word by prefix
+# only when the trailing difference is one of these (prevents "attic"->"atticus"
+# while preserving "mad"->"madness").
+_MORPH_SUFFIXES = (
+    "s", "es", "ed", "ing", "er", "est", "ly",
+    "ness", "ment", "tion", "sion", "ation",
+    "ous", "ious", "ful", "less", "able", "ible",
+    "ive", "al", "ial", "ical", "ity", "ty",
+    "ence", "ance", "dom", "ship", "ism", "ist",
+    "ize", "ise", "ify", "en",
+)
+
+
+def _is_morph_prefix(shorter: str, longer: str) -> bool:
+    """True if `shorter` is a morphological prefix of `longer`."""
+    if not longer.startswith(shorter):
+        return False
+    suffix = longer[len(shorter):]
+    if not suffix:
+        return True  # exact match
+    # Short stems (<=3 chars) are too ambiguous for prefix matching
+    # (e.g. "mr" -> "mrs", "set" -> "setting").
+    if len(shorter) <= 3:
+        return False
+    return suffix in _MORPH_SUFFIXES
+
+
+def _name_words(name: str) -> FrozenSet[str]:
+    """Matchable words in a node name: latin/digit runs (len>=2) plus CJK
+    full-runs and individual CJK chars. Single source of truth shared by the
+    propagate seed matcher and the inverted index, so the two never drift."""
+    lower = name.lower()
+    words = set()
+    for part in _RE_NAME_SEP.split(lower):
+        for w in _RE_LATIN_WORD.findall(part):
+            if len(w) >= 2:
+                words.add(w)
+        for cjk in _RE_CJK_RUN.findall(part):
+            words.add(cjk)       # full run, e.g. "贾宝玉"
+            words.update(cjk)    # individual chars 贾, 宝, 玉
+    return frozenset(words)
+
+# Stop words filtered from propagate input (module-level; was rebuilt per call).
+# Deduped — "its" appeared twice in the original literal.
+_STOP_WORDS = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "be", "been",
+    "am", "do", "does", "did", "has", "have", "had", "it", "its",
+    "what", "who", "how", "why", "when", "where", "which",
+    "to", "of", "in", "on", "at", "by", "for", "with", "from",
+    "and", "or", "not", "no", "if", "but", "so", "as", "than",
+    "me", "my", "we", "us", "you", "he", "she", "they", "them",
+    "this", "that", "these", "those", "about", "tell", "describe",
+    "explain", "can", "could", "would", "should", "will",
+    "first", "last", "second", "third", "next", "new", "old",
+    "set", "sets", "get", "gets", "got", "put", "take", "took",
+    "make", "made", "give", "gave", "come", "came", "go", "went",
+    "one", "two", "three", "also", "just", "even", "still",
+    "most", "more", "much", "many", "some", "any", "all", "each",
+    "very", "own", "same", "other", "such", "only", "back",
+    "after", "before", "between", "through", "over", "under",
+    "into", "out", "up", "down", "off", "then", "now", "here",
+    "there", "way", "well", "part", "like", "being", "both",
+    "may", "might", "must", "shall", "his", "her", "our", "your",
+    "their", "him", "itself", "never", "always", "often",
+})
 
 
 class STGEngine:
@@ -208,8 +323,21 @@ class STGEngine:
         self._last_propagation_metrics: Optional[PropagationMetrics] = None
         self._importance_cache: Optional[Dict[str, float]] = None
         self._graph_metrics_cache: Optional[GraphMetrics] = None
-        self._gravity_map = None  # Optional[GravityMap] — cached, invalidated on mutation
+        self._gravity_map = None  # Optional[GravityMap] — live cache, cleared on mutation
+        self._gravity_cache_pending = None  # (blob, n_nodes, n_edges, built_at) loaded from disk (F6)
+        self._gravity_persist = None  # (blob, n_nodes, n_edges, built_at) to persist on save;
+        #   captured at build time so it survives Hebbian's salience-only invalidation
 
+        # ── F3 (review 2026-07-08): lazy-subsystem registry — assessed, DEFERRED ──
+        # The lazy subsystem handles below (_learner / _cognitive / _feedback /
+        # _telemetry / _conflict_detector / embedding trio) were flagged for
+        # collapsing into a `self._subsystems` dict + unified lazy getter. Kept
+        # flat deliberately: these handles have ~119 access sites (69 here + ~50
+        # across other modules and tests), so a registry means either a ~119-site
+        # rename (high churn/risk) or ~9 property-forwarding shims that add an
+        # indirection layer (less readable, not more). Surface >> benefit (pure
+        # __init__ cosmetics), so — per the review's own guidance — documented
+        # rather than churned. Revisit if this init crosses ~25 handles.
         # Learning (Phase 7B)
         self._learner = None  # Optional[HebbianLearner]
         self._learning_log: List = []  # List[LearningEvent]
@@ -225,6 +353,7 @@ class STGEngine:
         self._embed_model = None       # Loaded lazily on first search()
         self._vector_index = None      # VectorIndex instance
         self._embed_texts = None       # Dict[str, str] from EmbeddingBuilder
+        self._embed_store_path = None  # .stg file with persisted vectors (set by load())
         self._model_name = None        # Name of loaded model
 
         # Kanerva extensions (Phase 8)
@@ -244,6 +373,13 @@ class STGEngine:
         # Inhibition (Phase 9) — disabled by default
         self._inhibition_config: InhibitionConfig = InhibitionConfig()
         self._refractory_set: Dict[str, float] = {}  # node → prior activation
+
+        # Inverted word index for propagate seed matching (F5) — lazy,
+        # per-process; invalidated on graph mutation via _invalidate_caches.
+        self._word_index: Optional[Dict[str, set]] = None       # word → {nk}
+        self._word_first_char: Optional[Dict[str, set]] = None  # first char → {word}
+        self._cjk_name_nodes: Optional[set] = None              # {nk : name has CJK}
+        self._node_words: Optional[Dict[str, FrozenSet[str]]] = None  # nk → _name_words(nk)
 
     # ═══════════════════════════════════════════════════════════
     # Inhibition Configuration (Phase 9)
@@ -281,6 +417,86 @@ class STGEngine:
         self._importance_cache = None
         self._graph_metrics_cache = None
         self._gravity_map = None
+        # F6: drop the live map + the disk-loaded pending cache on mutation.
+        # NOT _gravity_persist — Hebbian invalidates on a salience-only change
+        # (topology unchanged), and gravity is topology-based, so the map is
+        # still valid to persist; a real topology change is caught by the
+        # node/edge-count version check on the next load.
+        self._gravity_cache_pending = None
+        # F5 inverted word index (rebuilt lazily on next propagate).
+        self._word_index = None
+        self._word_first_char = None
+        self._cjk_name_nodes = None
+        self._node_words = None
+
+    def _ensure_word_index(self) -> None:
+        """Lazily build the inverted word index for propagate seed matching.
+
+        Maps word -> {node keys containing it}, plus a first-char bucket of
+        words and the set of nodes whose name contains CJK, plus a per-node
+        cache of _name_words(). Built once per process; set to None on any graph
+        mutation via _invalidate_caches, so it rebuilds on the next propagate.
+        """
+        if self._word_index is not None:
+            return
+        wi: Dict[str, set] = {}
+        fc: Dict[str, set] = {}
+        cjk_nodes: set = set()
+        node_words: Dict[str, FrozenSet[str]] = {}
+        for nk in self._nodes:
+            words = _name_words(nk)
+            node_words[nk] = words
+            for w in words:
+                bucket = wi.get(w)
+                if bucket is None:
+                    wi[w] = bucket = set()
+                bucket.add(nk)
+                first = w[0]
+                fcb = fc.get(first)
+                if fcb is None:
+                    fc[first] = fcb = set()
+                fcb.add(w)
+            if _HAS_CJK.search(nk):
+                cjk_nodes.add(nk)
+        # Publish the sentinel (_word_index) LAST so a concurrent reader (e.g.
+        # the multi-threaded HTTP server sharing one engine) never sees the
+        # "index is built" guard pass while the companion fields are still None.
+        self._word_first_char = fc
+        self._cjk_name_nodes = cjk_nodes
+        self._node_words = node_words
+        self._word_index = wi
+
+    def _seed_candidates(self, long_tokens: List[str], short_tokens: List[str]):
+        """Superset of node keys that could match, to prune the seed scan.
+
+        Returns None to mean 'scan every node' — short tokens substring-match
+        against the full name, which the word index cannot narrow. Otherwise
+        the returned set is a proven superset of the full-scan matches:
+          * exact word match      -> _word_index[token]
+          * morphological prefix (either direction) shares the token's first
+            character -> scan only that first-char word bucket
+          * CJK substring fallback -> only nodes whose name contains CJK
+        The per-node matching below re-checks each candidate with the exact
+        original logic, so false candidates are harmlessly filtered out.
+        """
+        if short_tokens:
+            return None
+        wi = self._word_index
+        fc = self._word_first_char
+        cjk_nodes = self._cjk_name_nodes
+        cand: set = set()
+        for t in long_tokens:
+            exact = wi.get(t)
+            if exact:
+                cand |= exact
+            for w in fc.get(t[0], ()):
+                if w != t and (_is_morph_prefix(t, w) or _is_morph_prefix(w, t)):
+                    cand |= wi[w]
+            if _HAS_CJK.search(t):
+                for nk in cjk_nodes:
+                    if t in nk:
+                        cand.add(nk)
+        return cand
 
     # ═══════════════════════════════════════════════════════════
     # Case-insensitive node key normalization
@@ -480,7 +696,7 @@ class STGEngine:
         self,
         source: str,
         target: str,
-        confidence: float = 0.5,
+        confidence: float = 1.0,  # v1.2 Protocol §4.2.1 default (was 0.5 pre-v1.2)
         strength: float = 0.5,
         rule: Optional[str] = None,
         time: Optional[str] = None,
@@ -534,7 +750,6 @@ class STGEngine:
         # G6 fix: conflict detection — check for contradictions before writing
         if modifiers.get("edge_class") != "virtual":
             if self._conflict_detector is None:
-                from stg_engine.kanerva import ConflictDetector
                 self._conflict_detector = ConflictDetector()
             # Build full modifier dict including named params for contradiction check
             _check_mods = dict(modifiers)
@@ -569,7 +784,19 @@ class STGEngine:
         # same (semantic_field, value) but DIFFERENT target — the only
         # configuration that signals an actual correction.
         existing_edge = self._edges_lookup.get((_src, _tgt))
-        if existing_edge and existing_edge.modifiers.get("edge_class") != "virtual":
+        # A virtual edge must never mask a real one — when a proximity hint
+        # already sits on this pair and a real edge arrives, fall through and
+        # create it. But virtual-over-virtual IS a true duplicate: without
+        # this the sibling generator re-emits the same hint on every ingest
+        # that touches the parent, and the pair accumulates without bound
+        # (measured 2026-08-30: 20323 virtual edges over 5029 distinct pairs,
+        # worst pair repeated 65x).
+        _new_is_virtual = modifiers.get("edge_class") == "virtual"
+        _existing_is_virtual = (
+            existing_edge is not None
+            and existing_edge.modifiers.get("edge_class") == "virtual"
+        )
+        if existing_edge and (not _existing_is_virtual or _new_is_virtual):
             # Check if new edge is semantically identical to existing
             same_conf = abs(existing_edge.confidence - confidence) < 0.001
             same_strength = abs(existing_edge.strength - strength) < 0.001
@@ -998,7 +1225,7 @@ class STGEngine:
         self,
         stl_text: str,
         session_id: Optional[str] = None,
-        auto_virtual: bool = True,
+        auto_virtual: bool = False,
         created_at: Optional[float] = None,
     ) -> int:
         """Parse STL text and add all statements to the graph.
@@ -1006,7 +1233,11 @@ class STGEngine:
         Args:
             stl_text: Raw STL text containing statements
             session_id: Optional session to associate edges with
-            auto_virtual: If True, auto-create virtual edges between siblings
+            auto_virtual: If True, auto-create virtual edges between siblings.
+                Defaults to False — virtual edges are proximity hints that
+                measurably do not change retrieval ranking, while inflating
+                the graph and burying the temporal face in clique noise.
+                Opt in via `stg config set virtual.enabled true`.
             created_at: Custom creation timestamp (epoch float). Defaults to current time.
 
         Returns:
@@ -1035,8 +1266,11 @@ class STGEngine:
             tgt_ns, tgt_name = self._parse_anchor_name(target)
 
             # Extract modifiers
+            # v1.2 (Protocol §4.2): confidence defaults to 1.0 (analytic assertive);
+            # rule defaults to inference from meta-semantic field, falling back to
+            # "definitional" if no meta field present.
             modifiers = {}
-            confidence = 0.5
+            confidence = 1.0
             strength = 0.5
             rule = None
             time_val = None
@@ -1048,9 +1282,13 @@ class STGEngine:
                 custom = mod_dict.pop("custom", {})
                 modifiers = {**mod_dict, **custom}
 
-                confidence = modifiers.pop("confidence", 0.5)
-                strength = modifiers.pop("strength", 0.5)
+                confidence = modifiers.pop("confidence", 1.0)
+                strength_raw = modifiers.pop("strength", None)
+                strength = float(strength_raw) if strength_raw is not None else 0.5
                 rule = modifiers.pop("rule", None)
+                # v1.2 §4.2.2 — infer rule from meta-semantic field if absent
+                if rule is None:
+                    rule = _infer_rule_from_meta(modifiers, has_strength=strength_raw is not None)
                 time_val = modifiers.pop("time", None)
                 # Pop to avoid collision with add_edge() positional params,
                 # but preserve user-provided `source` (provenance per STL Protocol).
@@ -1062,6 +1300,11 @@ class STGEngine:
                 mod_created_at = modifiers.pop("created_at", None)
                 if mod_created_at is not None and created_at is None:
                     created_at = float(mod_created_at)
+
+            # v1.2 §4.2.2 last row: no meta field present → default to "definitional".
+            # This also catches edges with no modifier block at all (e.g., bare [A] -> [B]).
+            if rule is None:
+                rule = "definitional"
 
                 # Auto-parse timestamp modifier into created_at
                 timestamp_str = modifiers.get("timestamp")
@@ -1109,7 +1352,7 @@ class STGEngine:
         path: str,
         session_id: Optional[str] = None,
         created_at: Optional[float] = None,
-        auto_virtual: bool = True,
+        auto_virtual: bool = False,
     ) -> int:
         """Parse a text file containing STL statements and add to graph.
 
@@ -1119,7 +1362,8 @@ class STGEngine:
             path: Path to file containing STL statements
             session_id: Optional session to associate with
             created_at: Custom creation timestamp (epoch float). Defaults to current time.
-            auto_virtual: If True, auto-create virtual edges between siblings.
+            auto_virtual: If True, auto-create virtual edges between siblings
+                (default False — see ingest_stl).
 
         Returns:
             Number of edges added
@@ -1132,7 +1376,7 @@ class STGEngine:
         self,
         stl_text: str,
         session_id: Optional[str] = None,
-        auto_virtual: bool = True,
+        auto_virtual: bool = False,
         created_at: Optional[float] = None,
     ) -> int:
         """Fallback STL parser using regex for simple statements.
@@ -1158,8 +1402,10 @@ class STGEngine:
             tgt_ns, tgt_name = self._parse_anchor_name(target_raw)
 
             # Extract modifiers
+            # v1.2 (Protocol §4.2): confidence defaults to 1.0; rule inferred
+            # from meta-semantic field when absent.
             modifiers = {}
-            confidence = 0.5
+            confidence = 1.0
             strength = 0.5
             rule = None
             time_val = None
@@ -1170,9 +1416,13 @@ class STGEngine:
             if mod_match:
                 mod_text = mod_match.group(1)
                 modifiers = self._parse_modifier_text(mod_text)
-                confidence = float(modifiers.pop("confidence", 0.5))
-                strength = float(modifiers.pop("strength", 0.5))
+                confidence = float(modifiers.pop("confidence", 1.0))
+                strength_raw = modifiers.pop("strength", None)
+                strength = float(strength_raw) if strength_raw is not None else 0.5
                 rule = modifiers.pop("rule", None)
+                # v1.2 §4.2.2 — infer rule from meta-semantic field if absent
+                if rule is None:
+                    rule = _infer_rule_from_meta(modifiers, has_strength=strength_raw is not None)
                 time_val = modifiers.pop("time", None)
                 # Preserve user-provided `source` (provenance per STL Protocol);
                 # other names popped to avoid collision with add_edge() params.
@@ -1194,6 +1444,11 @@ class STGEngine:
                         edge_created_at = _parse_dt(timestamp_str).timestamp()
                     except (ValueError, ImportError):
                         pass
+
+            # v1.2 §4.2.2 last row: no meta field → default to "definitional".
+            # Also catches edges with no modifier block at all.
+            if rule is None:
+                rule = "definitional"
 
             # STL Protocol §9.4: see ingest_stl for the rationale.
             if self._try_materialize_intrinsic_properties(
@@ -1402,16 +1657,50 @@ class STGEngine:
     def clear_virtual_edges(self) -> int:
         """Remove all virtual edges from the graph.
 
+        Removes by edge *identity*, not by (source, target) key. A pair can
+        carry several parallel edges, and remove_edge() drops only the one
+        the lookup happens to point at — so the old key-based loop was both
+        non-idempotent (one pass left ~75% of the duplicates behind, needing
+        a dozen more) and destructive (it deleted the real edge whenever a
+        real and a virtual edge shared a pair). Measured on the live graph
+        2026-08-30 before this fix: one pass cleared 5029 of 20323 virtual
+        edges and took 2 real knowledge edges with it.
+
         Returns:
-            Number of virtual edges removed
+            Number of virtual edges actually removed
         """
-        to_remove = [
-            (e.source, e.target) for e in self._edges
-            if e.modifiers.get("edge_class") == "virtual"
-        ]
-        for src, tgt in to_remove:
-            self.remove_edge(src, tgt)
-        return len(to_remove)
+        survivors = []
+        removed = 0
+        for e in self._edges:
+            if e.modifiers.get("edge_class") == "virtual":
+                removed += 1
+            else:
+                survivors.append(e)
+        if not removed:
+            return 0
+        self._edges = survivors
+        self._reindex_edges()
+        self._invalidate_caches()
+        return removed
+
+    def _reindex_edges(self) -> None:
+        """Rebuild _edges_lookup and _graph edges from self._edges.
+
+        Call after any bulk removal that bypasses remove_edge(). Mirrors the
+        indexing done when a graph is loaded from disk: last edge wins per
+        pair, and a graph edge survives only while some edge still uses it.
+        """
+        _nk = self._nk
+        lookup = {}
+        live_pairs = set()
+        for edge in self._edges:
+            key = (_nk(edge.source), _nk(edge.target))
+            lookup[key] = edge
+            live_pairs.add(key)
+        self._edges_lookup = lookup
+        for src, tgt in [e for e in self._graph.edges()]:
+            if (src, tgt) not in live_pairs:
+                self._graph.remove_edge(src, tgt)
 
     def get_virtual_edge_stats(self) -> Dict[str, Any]:
         """Return statistics about virtual edges."""
@@ -1556,28 +1845,6 @@ class STGEngine:
             List of activated node names, sorted by activation descending
         """
         # Tokenize with stop word and short token filtering
-        _stop = {
-            "a", "an", "the", "is", "are", "was", "were", "be", "been",
-            "am", "do", "does", "did", "has", "have", "had", "it", "its",
-            "what", "who", "how", "why", "when", "where", "which",
-            "to", "of", "in", "on", "at", "by", "for", "with", "from",
-            "and", "or", "not", "no", "if", "but", "so", "as", "than",
-            "me", "my", "we", "us", "you", "he", "she", "they", "them",
-            "this", "that", "these", "those", "about", "tell", "describe",
-            "explain", "can", "could", "would", "should", "will",
-            # Common generic words that cause false seed matches
-            "first", "last", "second", "third", "next", "new", "old",
-            "set", "sets", "get", "gets", "got", "put", "take", "took",
-            "make", "made", "give", "gave", "come", "came", "go", "went",
-            "one", "two", "three", "also", "just", "even", "still",
-            "most", "more", "much", "many", "some", "any", "all", "each",
-            "very", "own", "same", "other", "such", "only", "back",
-            "after", "before", "between", "through", "over", "under",
-            "into", "out", "up", "down", "off", "then", "now", "here",
-            "there", "way", "well", "part", "like", "being", "both",
-            "may", "might", "must", "shall", "his", "her", "our", "your",
-            "their", "its", "him", "itself", "never", "always", "often",
-        }
         raw = input_text.lower().split()
         # Split compound tokens (hyphen, underscore) into parts too
         # and strip trailing punctuation from each part
@@ -1594,11 +1861,10 @@ class STGEngine:
                 if seq not in expanded:
                     expanded.append(seq)
         # CJK chars are semantically meaningful at len=1, so only filter len<2 for ASCII
-        _has_cjk = re.compile(r'[\u4e00-\u9fff\u3400-\u4dbf]')
-        tokens = [t for t in expanded if (len(t) >= 2 or _has_cjk.search(t)) and t not in _stop]
+        tokens = [t for t in expanded if (len(t) >= 2 or _HAS_CJK.search(t)) and t not in _STOP_WORDS]
         if not tokens:
             # Fallback 1: non-stop words of any length
-            tokens = [t for t in expanded if t not in _stop]
+            tokens = [t for t in expanded if t not in _STOP_WORDS]
         if not tokens:
             # Fallback 2: all words (for single-char node names in tests)
             tokens = expanded if expanded else raw
@@ -1612,7 +1878,20 @@ class STGEngine:
         short_tokens = [t for t in tokens if len(t) < 2]
         # Track (node_name, hit_count, matched_tokens) for IDF scoring
         matching_hits: List[Tuple[str, int, List[str]]] = []
+
+        # F5 inverted index: restrict the scan to a candidate superset so the
+        # expensive per-node morphology check runs only on nodes that can match.
+        # We still iterate self._nodes in order and merely filter, so
+        # matching_hits is built in the identical order to a full scan — keeping
+        # seed-cap tie-breaking (hence the selected seed set) unchanged.
+        # candidates=None => scan every node (short-token substring case).
+        self._ensure_word_index()
+        candidates = self._seed_candidates(long_tokens, short_tokens)
+        node_words = self._node_words
+
         for name in self._nodes:
+            if candidates is not None and name not in candidates:
+                continue
             name_lower = name.lower()
             hit_count = 0
             # Short token: substring match (backward compat for single-char nodes)
@@ -1623,44 +1902,7 @@ class STGEngine:
                     continue
             # Long token: word boundary match with hit counting
             if long_tokens:
-                name_parts = re.split(r'[_:\-]', name_lower)
-                words = []
-                for p in name_parts:
-                    # Latin/digit words
-                    words.extend(
-                        w.lower() for w in re.findall(r'[a-z]+|[A-Z][a-z]*|\d+', p)
-                        if len(w) >= 2
-                    )
-                    # CJK characters: each char is a word, also keep full string
-                    cjk_chars = re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]+', p)
-                    for cjk in cjk_chars:
-                        words.append(cjk)  # full string (e.g. "贾宝玉")
-                        words.extend(cjk)  # individual chars (e.g. "贾","宝","玉")
-                # Morphological prefix matching: only allow prefix match when
-                # the suffix is a known English morphological ending.
-                # This prevents false matches like "attic" → "atticus"
-                # while preserving valid ones like "mad" → "madness".
-                _morph_suffixes = (
-                    "s", "es", "ed", "ing", "er", "est", "ly",
-                    "ness", "ment", "tion", "sion", "ation",
-                    "ous", "ious", "ful", "less", "able", "ible",
-                    "ive", "al", "ial", "ical", "ity", "ty",
-                    "ence", "ance", "dom", "ship", "ism", "ist",
-                    "ize", "ise", "ify", "en",
-                )
-
-                def _is_morph_prefix(shorter: str, longer: str) -> bool:
-                    """Check if shorter is a morphological prefix of longer."""
-                    if not longer.startswith(shorter):
-                        return False
-                    suffix = longer[len(shorter):]
-                    if not suffix:
-                        return True  # exact match
-                    # Short stems (<=3 chars) are too ambiguous for prefix
-                    # matching (e.g. "mr" → "mrs", "set" → "setting")
-                    if len(shorter) <= 3:
-                        return False
-                    return suffix in _morph_suffixes
+                words = node_words[name]
 
                 # Per-token matching with IDF tracking
                 matched_tokens = []
@@ -1673,7 +1915,7 @@ class STGEngine:
                 hit_count = len(matched_tokens)
                 # CJK substring match: "宝玉" should match node "贾宝玉"
                 if hit_count == 0:
-                    cjk_tokens = [t for t in long_tokens if _has_cjk.search(t)]
+                    cjk_tokens = [t for t in long_tokens if _HAS_CJK.search(t)]
                     for ct in cjk_tokens:
                         if ct in name_lower:
                             hit_count += 1
@@ -1687,7 +1929,7 @@ class STGEngine:
         for _, _, mtokens in matching_hits:
             for tk in mtokens:
                 _token_df[tk] = _token_df.get(tk, 0) + 1
-        _log = __import__("math").log
+        _log = math.log
         _token_idf = {tk: _log(_N / (1 + df)) for tk, df in _token_df.items()}
 
         # IDF-weighted hit score: sum of IDF weights of matched tokens
@@ -1841,7 +2083,12 @@ class STGEngine:
             (name, act) for name, act in activation_map.items()
             if act > effective_threshold
         ]
-        activated.sort(key=lambda x: x[1], reverse=True)
+        # Deterministic order: activation descending, then node key ascending as
+        # a stable tie-break. Without the name tie-break, equal-activation nodes
+        # inherit the Rust core's HashMap iteration order, which is randomized
+        # per call — making recall output non-reproducible across (and even
+        # within) processes. The result SET is unaffected; only tie order.
+        activated.sort(key=lambda x: (-x[1], x[0]))
 
         # Compute and store propagation metrics (Phase 7A)
         from stg_engine.metrics import (
@@ -1870,28 +2117,7 @@ class STGEngine:
         # learning signal or pollute telemetry counters meant for the agent's
         # own CLI propagations.
         if not read_only:
-            # Hebbian learning hook (Phase 7B)
-            learning_events = []
-            if self._learner is not None:
-                learning_events = self._learner.learn_from_propagation(
-                    self, activation_map
-                )
-                self._learning_log.extend(learning_events)
-
-            # Telemetry hook (Phase 10)
-            if self._telemetry is not None:
-                strengthen_count = sum(
-                    1 for e in learning_events if e.event_type == "strengthen"
-                )
-                weaken_count = sum(
-                    1 for e in learning_events if e.event_type == "weaken"
-                )
-                self._telemetry.record_propagation(
-                    self._last_propagation_metrics, activation_map,
-                    strengthen_count, weaken_count,
-                )
-                if learning_events:
-                    self._telemetry.record_edge_mutations(learning_events)
+            self.apply_learning_tail(activation_map)
 
         return [self._dn(name) for name, _ in activated]
 
@@ -2326,12 +2552,50 @@ class STGEngine:
     def get_gravity_map(self):
         """Get or build the gravity map (multi-resolution community structure).
 
-        Cached until graph is mutated.
+        Cached until the graph is mutated. F6: on a fresh process a persisted
+        map loaded from disk is restored instead of rebuilt when the graph is
+        unchanged (same node/edge counts as when it was persisted), skipping the
+        ~700ms Louvain + elevation build.
         """
         if self._gravity_map is None:
+            pending = self._gravity_cache_pending
+            if pending is not None:
+                blob, n_nodes, n_edges, built = pending
+                if n_nodes == len(self._nodes) and n_edges == len(self._edges):
+                    import json as _json
+                    from stg_engine.gravity import GravityMap
+                    self._gravity_map = GravityMap(**_json.loads(blob))
+                    # Hold for persistence (reuse the blob, no re-serialize).
+                    self._gravity_persist = (blob, n_nodes, n_edges, built)
+                    return self._gravity_map
+                # Counts changed -> stale; drop so we don't re-check every call.
+                self._gravity_cache_pending = None
             from stg_engine.gravity import build_gravity_map
             self._gravity_map = build_gravity_map(self)
+            # Capture the persistence payload NOW (build-time counts), so it
+            # survives the salience-only invalidation Hebbian triggers before save.
+            self._gravity_persist = (
+                self._serialize_gravity_map(self._gravity_map),
+                len(self._nodes), len(self._edges),
+                self._gravity_map.built_at,
+            )
         return self._gravity_map
+
+    @staticmethod
+    def _serialize_gravity_map(gm) -> str:
+        import dataclasses as _dc
+        import json as _json
+        return _json.dumps(_dc.asdict(gm), ensure_ascii=False)
+
+    def _gravity_cache_payload(self):
+        """(blob, node_count, edge_count, built_at) to persist, or None.
+
+        The last built/restored gravity map, captured at BUILD time with the
+        graph's counts then, so it survives Hebbian's post-propagate
+        salience-only invalidation. A future load restores it only when those
+        counts still match the graph (a topology change forces a rebuild).
+        """
+        return self._gravity_persist
 
     # ═══════════════════════════════════════════════════════════
     # Learning (Phase 7B)
@@ -2351,6 +2615,26 @@ class STGEngine:
     def disable_learning(self) -> None:
         """Disable auto-learning after propagate()."""
         self._learner = None
+
+    def apply_learning_tail(self, activation_map: Dict[str, float]) -> None:
+        """Hebbian learning + telemetry for one activation map (the write tail of propagate()).
+
+        Exposed so wrappers that run several read_only sub-propagates (multi-seed chain intersection)
+        can learn ONCE from the merged result instead of paying the full-edge-scan learner per token
+        (10 tokens × ~1.2 s on a 21k-edge graph, measured 2026-08-23).
+        """
+        learning_events = []
+        if self._learner is not None:
+            learning_events = self._learner.learn_from_propagation(self, activation_map)
+            self._learning_log.extend(learning_events)
+        if self._telemetry is not None:
+            strengthen_count = sum(1 for e in learning_events if e.event_type == "strengthen")
+            weaken_count = sum(1 for e in learning_events if e.event_type == "weaken")
+            self._telemetry.record_propagation(
+                self._last_propagation_metrics, activation_map, strengthen_count, weaken_count,
+            )
+            if learning_events:
+                self._telemetry.record_edge_mutations(learning_events)
 
     @property
     def learning_enabled(self) -> bool:
@@ -2635,11 +2919,14 @@ class STGEngine:
             search_time_ms=elapsed,
         )
 
-    def build_search_index(self, model_name: str = None) -> int:
+    def build_search_index(self, model_name: str = None, exclude=None) -> int:
         """Build or rebuild the embedding index for all nodes.
 
         Args:
             model_name: Override default model name
+            exclude: Optional set of normalized node keys to leave out of the
+                index (e.g. bookkeeping nodes the recall layer hides — they
+                stay in the graph as records but should not occupy seed slots)
 
         Returns:
             Number of nodes indexed
@@ -2655,6 +2942,11 @@ class STGEngine:
 
         builder = EmbeddingBuilder()
         self._embed_texts = builder.build_all(self)
+        if exclude:
+            self._embed_texts = {
+                n: t for n, t in self._embed_texts.items()
+                if self._nk(n) not in exclude
+            }
 
         if not self._embed_texts:
             self._vector_index = VectorIndex()
@@ -2673,14 +2965,39 @@ class STGEngine:
         return self._vector_index.size
 
     def _ensure_search_ready(self) -> None:
-        """Load model and build index if not already done."""
+        """Load model, then hydrate the persisted index or build one."""
         if self._embed_model is None:
             from stg_engine.semantic import load_embedding_model, DEFAULT_MODEL_NAME
             self._model_name = DEFAULT_MODEL_NAME
             self._embed_model = load_embedding_model(DEFAULT_MODEL_NAME)
 
         if self._vector_index is None or self._vector_index.size == 0:
-            self._build_vector_index()
+            if not self._hydrate_vector_index():
+                self._build_vector_index()
+
+    def _hydrate_vector_index(self) -> bool:
+        """Rebuild the in-memory index from vectors persisted by `stg embed`.
+
+        The CLI runs one command per process, so without this every search
+        re-encoded the entire graph (minutes on 10k nodes) instead of reading
+        the vectors `stg embed` had already saved — the save path existed
+        since Phase 7G but nothing ever called load_embeddings. Returns False
+        when nothing usable is persisted (no store path, empty table, or a
+        model mismatch) so the caller falls back to a full build.
+        """
+        if not self._embed_store_path:
+            return False
+        from stg_engine.persistence import load_embeddings
+        from stg_engine.semantic import VectorIndex
+        data = load_embeddings(self._embed_store_path, expected_model=self._model_name)
+        if not data:
+            return False
+        vectors = data["vectors"]
+        idx = VectorIndex()
+        idx.build({name: vectors[i] for i, name in enumerate(data["names"])})
+        self._vector_index = idx
+        self._embed_texts = data["embed_texts"]
+        return True
 
     def _build_vector_index(self) -> None:
         """Build vector index from current graph state."""
@@ -2723,6 +3040,7 @@ class STGEngine:
             snapshots=self._snapshots,
             force_save=force_save,
             aliases=self._aliases if self._aliases else None,
+            gravity_cache=self._gravity_cache_payload(),
         )
 
     @classmethod
@@ -2738,6 +3056,7 @@ class STGEngine:
         state = load_engine_state(path)
 
         engine = cls()
+        engine._embed_store_path = path
         _nk = cls._nk
 
         # Restore nodes — normalize keys, merge case duplicates
@@ -2772,6 +3091,10 @@ class STGEngine:
         # G7: Load aliases if present
         engine._aliases = state.get("aliases", {})
 
+        # F6: stash the persisted gravity map (lazy — restored by get_gravity_map
+        # only if the graph counts still match).
+        engine._gravity_cache_pending = state.get("gravity_cache")
+
         return engine
 
     def export_stl(self) -> str:
@@ -2791,7 +3114,12 @@ class STGEngine:
         lines = []
         for edge in self._edges:
             mods = {}
-            if edge.confidence != 0.5:
+            # v1.2 Protocol §4.2.1: skip default values during serialization so
+            # round-trip preserves the default-omitted form. confidence default
+            # is 1.0 (assertive); strength default 0.5 is engine-internal
+            # (Protocol marks strength absent on non-causal edges, but the
+            # engine stores 0.5 as the legacy fallback).
+            if edge.confidence != 1.0:
                 mods["confidence"] = edge.confidence
             if edge.strength != 0.5:
                 mods["strength"] = edge.strength
@@ -2813,7 +3141,8 @@ class STGEngine:
         lines = []
         for edge in self._edges:
             mod_parts = []
-            if edge.confidence != 0.5:
+            # v1.2 default-omitted serialization — see _export_stl above.
+            if edge.confidence != 1.0:
                 mod_parts.append(f"confidence={edge.confidence}")
             if edge.strength != 0.5:
                 mod_parts.append(f"strength={edge.strength}")

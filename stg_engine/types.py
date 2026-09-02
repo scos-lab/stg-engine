@@ -80,7 +80,10 @@ class STGEdge:
     target: str
 
     # Extracted key fields — hot path for computation
-    confidence: float = 0.5
+    # v1.2 (Operational Protocol §4.2.1): confidence defaults to 1.0 (assertive,
+    # reserved for analytic truths). Empirical claims should write a canonical
+    # level explicitly: 0.95 / 0.8 / 0.5 / 0.2 / 0.01.
+    confidence: float = 1.0
     strength: float = 0.5
     rule: Optional[str] = None        # causal / logical / empirical / definitional
     time: Optional[str] = None
