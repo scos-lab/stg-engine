@@ -63,6 +63,11 @@ clear `could not acquire STG write lock` error (instead of corrupting the graph)
 — just retry. Set `STG_NO_INTERLOCK=1` to bypass the lock (recovery only). On
 Windows the lock is always exclusive (`msvcrt` has no shared mode).
 
+A save rewrites the whole file from engine state, but every **side table** a
+subsystem keeps in the `.stg` (skill audit, embeddings, telemetry, pruning
+log, perception, or a table of your own) is carried across verbatim — no
+registration needed. If you add a table, it survives the next save.
+
 ---
 
 ## Essential Commands (80% of what you need)
@@ -630,7 +635,8 @@ stg use My_Skill --args-stl '[Arg:input] → [File] ::mod(path="/tmp/x")'
 stg use My_Skill --args-stl-file /tmp/params.stl
 ```
 
-Every invocation writes one row to the `skill_invocations` audit table.
+Every invocation writes one row to the `skill_invocations` audit table (it
+survives later saves of the graph).
 
 ```bash
 stg skill history --limit 10
@@ -824,6 +830,9 @@ capability by name."
 | `importance --top 10` | Most important nodes |
 | `learn path <n1> <n2> <n3>` | Explicitly strengthen a known-good path |
 | `prune --dry-run` | Preview what would be pruned |
+| `pruned [--limit N] [--type T]` | Pruning audit log: what was removed and why |
+| `pruned purge --type T \| --before DATE` | Delete audit rows (dumped to `ARCHIVED/*.jsonl` first, then VACUUM). `--dry-run` to count |
+| `<cmd> --help` | Usage for one command, without running it |
 | `cognitive self-model` | Assessment of knowledge gaps and strengths |
 | `converge <query>` | Iterative propagation for vague queries |
 | `telemetry report` | Usage statistics |

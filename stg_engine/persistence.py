@@ -519,6 +519,79 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+# Tables save_engine_state rebuilds from in-memory engine state on every save.
+# Every OTHER table present in the previous file is a "side table" owned by
+# some subsystem (pruning audit, embeddings, telemetry, skill audit,
+# perception, ...) and is carried across verbatim by _carry_side_tables — no
+# per-table registration. The explicit carry list this replaced silently wiped
+# skill_invocations on every save and dropped telemetry_cooccurrence /
+# perception_* outright (found 2026-09-02).
+_REBUILT_TABLES = frozenset({
+    "schema_info", "nodes", "edges", "sessions", "events", "tensions",
+    "belief_evolutions", "system_snapshots", "aliases", "gravity_cache",
+})
+
+
+def _old_table_names(conn: sqlite3.Connection) -> set:
+    """Names of user tables in the ATTACHed ``old`` database."""
+    return {
+        r[0] for r in conn.execute(
+            "SELECT name FROM old.sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+
+
+def _carry_side_tables(conn: sqlite3.Connection) -> Dict[str, int]:
+    """Copy every non-rebuilt table from the ATTACHed ``old`` database into
+    ``main`` (the temp file being written). Returns {table: rows_copied}.
+
+    - Tables the current schema already creates: rows are copied over the
+      intersection of column names, so a file written by an older or newer
+      engine version still carries (extra columns on either side are ignored).
+    - Tables the current schema does not know: recreated from the old file's
+      own CREATE statements (table + indexes), then copied in full.
+
+    Runs as SQL-level bulk copies (``INSERT ... SELECT``) — no Python row
+    round-trips, so a large audit table costs milliseconds, not seconds.
+    """
+    carried: Dict[str, int] = {}
+    main_tables = {
+        r[0] for r in conn.execute(
+            "SELECT name FROM main.sqlite_master WHERE type='table'"
+        )
+    }
+    rows = conn.execute(
+        "SELECT name, sql FROM old.sqlite_master WHERE type='table' "
+        "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    ).fetchall()
+    for name, sql in rows:
+        if name in _REBUILT_TABLES or not sql:
+            continue
+        if name not in main_tables:
+            conn.execute(sql)
+            for (isql,) in conn.execute(
+                "SELECT sql FROM old.sqlite_master WHERE type='index' "
+                "AND tbl_name=? AND sql IS NOT NULL", (name,)
+            ).fetchall():
+                try:
+                    conn.execute(isql)
+                except sqlite3.OperationalError:
+                    pass  # index name clash — rows still carry, index is a luxury
+        old_cols = [r[1] for r in conn.execute(f'PRAGMA old.table_info("{name}")')]
+        new_cols = {r[1] for r in conn.execute(f'PRAGMA main.table_info("{name}")')}
+        cols = [c for c in old_cols if c in new_cols]
+        if not cols:
+            continue
+        col_list = ", ".join(f'"{c}"' for c in cols)
+        cur = conn.execute(
+            f'INSERT INTO main."{name}" ({col_list}) '
+            f'SELECT {col_list} FROM old."{name}"'
+        )
+        carried[name] = cur.rowcount if cur.rowcount is not None else 0
+    return carried
+
+
 def save_engine_state(
     path: str,
     nodes: Dict[str, STGNode],
@@ -590,6 +663,13 @@ def save_engine_state(
     conn = None
     try:
         conn = sqlite3.connect(str(tmp_path))
+        # Attach the previous file (read only) so its side tables can be
+        # carried across with SQL-level bulk copies (_carry_side_tables).
+        # ATTACH must run before any DML opens a transaction.
+        old_attached = False
+        if stg_path.exists():
+            conn.execute("ATTACH DATABASE ? AS old", (str(stg_path),))
+            old_attached = True
         # DELETE journal mode (not WAL) — avoids orphaned WAL/SHM files that
         # can't be renamed atomically with the main database file.
         conn.execute("PRAGMA journal_mode=DELETE")
@@ -705,82 +785,22 @@ def save_engine_state(
                 gravity_cache,
             )
 
-        # --- Preserve append-only tables from old file ---
-        if stg_path.exists():
-            old_conn = sqlite3.connect(str(stg_path))
-            old_tables = {
-                row[0] for row in old_conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall()
-            }
+        # --- Carry side tables from the old file (generic) ---
+        # Everything this function did not just rebuild from engine state
+        # (pruned_log, embeddings, telemetry_*, skill_invocations, perception_*,
+        # any future table) is copied verbatim — schema, indexes and rows —
+        # via SQL on the attached old database. See _carry_side_tables.
+        carried: Dict[str, int] = {}
+        if old_attached:
+            carried = _carry_side_tables(conn)
 
-            # Pruned log
-            if "pruned_log" in old_tables:
-                old_rows = old_conn.execute(
-                    "SELECT pruned_at, item_type, source, target, confidence, "
-                    "salience, last_used, modifiers_json, reason FROM pruned_log"
-                ).fetchall()
-                if old_rows:
-                    conn.executemany(
-                        "INSERT INTO pruned_log (pruned_at, item_type, source, target, "
-                        "confidence, salience, last_used, modifiers_json, reason) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        old_rows,
-                    )
-
-            # Embeddings (written only by `stg embed`): carry them across
-            # full saves or the first ingest after an embed silently wipes the
-            # vector table and the next search falls back to re-encoding the
-            # whole graph. Stale coverage (nodes added since the embed) is
-            # handled at search time, not here.
-            if "embeddings" in old_tables:
-                _emb_rows = old_conn.execute(
-                    "SELECT node_name, embed_text, vector, model_name, created_at "
-                    "FROM embeddings"
-                ).fetchall()
-                if _emb_rows:
-                    conn.executemany(
-                        "INSERT INTO embeddings "
-                        "(node_name, embed_text, vector, model_name, created_at) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        _emb_rows,
-                    )
-
-            # Telemetry tables (all append-only)
-            _telemetry_tables = [
-                ("telemetry_propagations",
-                 "timestamp, input_text, seed_count, activated_count, "
-                 "qe, rs, coverage, strengthen_count, weaken_count, top5_nodes"),
-                ("telemetry_node_freq",
-                 "node_name, activation_count, seed_count, "
-                 "total_activation, first_activated, last_activated"),
-                ("telemetry_sessions",
-                 "timestamp, propagation_count, total_strengthen, total_weaken, "
-                 "salience_p25, salience_p50, salience_p75, salience_mean, "
-                 "node_count, edge_count, psi"),
-                ("telemetry_edge_mutations",
-                 "timestamp, source, target, event_type, "
-                 "old_salience, new_salience, delta"),
-            ]
-            for tbl_name, cols in _telemetry_tables:
-                if tbl_name in old_tables:
-                    old_rows = old_conn.execute(
-                        f"SELECT {cols} FROM {tbl_name}"
-                    ).fetchall()
-                    if old_rows:
-                        placeholders = ", ".join("?" * len(old_rows[0]))
-                        conn.executemany(
-                            f"INSERT INTO {tbl_name} ({cols}) VALUES ({placeholders})",
-                            old_rows,
-                        )
-
-            # Gravity cache: if the engine didn't supply a fresh map, preserve
-            # the old one ONLY when it still matches the graph being saved (same
+            # Gravity cache: if the engine didn't supply a fresh map, keep the
+            # old one ONLY when it still matches the graph being saved (same
             # node/edge counts); otherwise it is stale, so drop it.
-            if gravity_cache is None and "gravity_cache" in old_tables:
-                grow = old_conn.execute(
+            if gravity_cache is None and "gravity_cache" in _old_table_names(conn):
+                grow = conn.execute(
                     "SELECT data, node_count, edge_count, built_at "
-                    "FROM gravity_cache WHERE id = 1"
+                    "FROM old.gravity_cache WHERE id = 1"
                 ).fetchone()
                 if (grow is not None and grow[1] == new_node_count
                         and grow[2] == new_edge_count):
@@ -791,9 +811,9 @@ def save_engine_state(
                         grow,
                     )
 
-            old_conn.close()
-
         conn.commit()
+        if old_attached:
+            conn.execute("DETACH DATABASE old")
         conn.close()
         conn = None
 
@@ -809,9 +829,17 @@ def save_engine_state(
             if leftover.exists():
                 leftover.unlink()
 
+        carried_note = ""
+        if carried:
+            nonzero = {k: v for k, v in carried.items() if v}
+            if nonzero:
+                carried_note = " | carried: " + ",".join(
+                    f"{k}={v}" for k, v in sorted(nonzero.items())
+                )
         _save_log.info(
             f"SAVE OK | nodes: {old_node_count}→{new_node_count} ({new_node_count - old_node_count:+d}) | "
             f"edges: {old_edge_count if old_node_count else 0}→{new_edge_count} | path={path}"
+            f"{carried_note}"
         )
 
     except Exception as exc:
@@ -1315,6 +1343,96 @@ def read_pruned_log(
 
     conn.close()
     return [dict(row) for row in rows]
+
+
+def purge_pruned_log(
+    path: str,
+    item_type: Optional[str] = None,
+    before: Optional[float] = None,
+    dump_path: Optional[str] = None,
+    dry_run: bool = False,
+    vacuum: bool = True,
+) -> Dict[str, Any]:
+    """Delete pruning audit records, dumping them to JSONL first (reversible).
+
+    Motivation (2026-09-02): virtual-edge churn wrote 619k rows into
+    pruned_log — 86% of a 226 MB .stg whose real graph was 4 MB — and every
+    whole-graph save re-copied them. The pruner no longer logs virtual edges;
+    this removes the backlog.
+
+    Args:
+        path: Path to .stg file (modified in place; callers hold the write lock)
+        item_type: Only rows of this item_type ("virtual_edge", "edge", "orphan_node")
+        before: Only rows with pruned_at < this epoch
+        dump_path: Where to write the JSONL dump. Default:
+                   <stg dir>/ARCHIVED/pruned_log-<timestamp>.jsonl
+        dry_run: Count only; delete nothing, write nothing
+        vacuum: Run VACUUM after deleting so the file actually shrinks
+
+    Returns:
+        dict(matched, deleted, dump_path, bytes_before, bytes_after)
+    """
+    import time as _time
+
+    stg_path = Path(path)
+    result: Dict[str, Any] = {
+        "matched": 0, "deleted": 0, "dump_path": None,
+        "bytes_before": stg_path.stat().st_size if stg_path.exists() else 0,
+        "bytes_after": None,
+    }
+    if not stg_path.exists():
+        return result
+
+    where: List[str] = []
+    params: List[Any] = []
+    if item_type:
+        where.append("item_type = ?")
+        params.append(item_type)
+    if before is not None:
+        where.append("pruned_at < ?")
+        params.append(float(before))
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+
+    conn = sqlite3.connect(str(stg_path))
+    conn.row_factory = sqlite3.Row
+    tables = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "pruned_log" not in tables:
+        conn.close()
+        result["bytes_after"] = result["bytes_before"]
+        return result
+
+    matched = conn.execute(
+        f"SELECT count(*) FROM pruned_log{clause}", params
+    ).fetchone()[0]
+    result["matched"] = matched
+    if matched == 0 or dry_run:
+        conn.close()
+        result["bytes_after"] = result["bytes_before"]
+        return result
+
+    if dump_path is None:
+        arch = stg_path.parent / "ARCHIVED"
+        arch.mkdir(parents=True, exist_ok=True)
+        dump_path = str(arch / f"pruned_log-{_time.strftime('%Y%m%d-%H%M%S')}.jsonl")
+    with open(dump_path, "w", encoding="utf-8") as fh:
+        for row in conn.execute(
+            f"SELECT * FROM pruned_log{clause} ORDER BY id", params
+        ):
+            fh.write(json.dumps(dict(row), ensure_ascii=False) + "\n")
+
+    cur = conn.execute(f"DELETE FROM pruned_log{clause}", params)
+    conn.commit()
+    result["deleted"] = cur.rowcount
+    result["dump_path"] = dump_path
+    if vacuum:
+        conn.execute("VACUUM")
+    conn.close()
+    result["bytes_after"] = stg_path.stat().st_size
+    return result
 
 
 # ═══════════════════════════════════════════════════════════

@@ -6,6 +6,48 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — side tables no longer wiped by whole-graph saves
+
+`save_engine_state` rebuilds the `.stg` from engine state and used to carry
+only an explicit list of extra tables across. `skill_invocations` was not on
+that list, so every `stg use` audit row was erased by the next write command
+(`stg skill history` had been empty for months with `skill.audit.enabled`
+true); `telemetry_cooccurrence` and `perception_*` were dropped outright. The
+carry is now **generic**: the previous file is `ATTACH`ed and every table the
+save does not rebuild (`_REBUILT_TABLES`) is copied verbatim — schema,
+indexes and rows — with `INSERT … SELECT`. Unknown tables are recreated from
+their own `CREATE` statements; known tables copy over the intersection of
+column names, so files written by older or newer engine versions still carry.
+The SQL-level copy also replaced Python row round-trips: a full save of a
+10k-node graph with a 620k-row audit table dropped from 2.2 s to 0.8 s.
+`SAVE OK` audit lines now list what was carried (`carried: pruned_log=767,…`).
+
+### Fixed — pruning no longer logs virtual-edge churn
+
+Stale virtual (sibling / co_source) edges are regenerated and re-pruned every
+session; logging each removal wrote 619k rows into one agent's `pruned_log`
+— 86 % of a 226 MB file whose real graph was 4 MB — and every save re-copied
+them. `SynapticPruner.prune()` now removes stale virtual edges without
+logging them (`log_virtual=True` restores the old behavior). Real-edge and
+orphan-node removals are still logged.
+
+### Added — `stg pruned purge` (reversible audit-log cleanup)
+
+`stg pruned purge --type virtual_edge` / `--before YYYY-MM-DD` / `--all`
+(`--dry-run`, `--no-vacuum`) dumps the matching rows to
+`<agent dir>/ARCHIVED/pruned_log-<timestamp>.jsonl`, deletes them, then
+`VACUUM`s. Refuses to run without a scope. Holds the write lock. On the
+author's graph: 618,950 rows, 226 MB → 32 MB in 4 s; propagate end-to-end
+2.7 s → 0.8 s because propagate's learning tail saves the graph.
+`stg pruned [--limit N] [--type T]` is now documented in `--help`.
+
+### Fixed — `stg <cmd> --help` no longer runs the command
+
+`stg propagate --help` used to propagate on the word "help" — and, being a
+learning command, save the graph (18 such saves in one audit log). `-h` /
+`--help` after any command now prints that command's help entry and exits
+before the lock, the engine load and any save.
+
 ### Added — Interprocess write lock (multi-session safety)
 
 Concurrent `stg` write commands no longer clobber each other. Every write

@@ -78,6 +78,9 @@ Direct file path: use --path <file.stg> to load any .stg file (overrides --agent
   telemetry [status|frequency|report]    Usage statistics
   simulate run --calibrated              Parameter simulation with real data
   backup [--keep N]                      Backup .stg file (auto-rotated)
+  pruned [--limit N] [--type T]          Pruning audit log (what was removed, why)
+  pruned purge --type T | --before DATE  Delete audit rows: dumped to ARCHIVED/*.jsonl
+         [--all] [--dry-run] [--no-vacuum]  first, then VACUUM (reversible)
   alias <add|list|remove|resolve>         Entity resolution aliases (G7)
   virtual [stats|list|rebuild]           Virtual edge management
   embed [--model NAME]                   Build/rebuild embedding index
@@ -3309,6 +3312,59 @@ def cmd_telemetry(engine, subcmd, args):
         print("  report                    Comprehensive telemetry report")
 
 
+def cmd_pruned_purge(args):
+    """`stg pruned purge` — delete pruning audit rows (dumped to JSONL first)."""
+    from stg_engine.persistence import purge_pruned_log
+
+    item_type = None
+    before = None
+    dry_run = "--dry-run" in args
+    vacuum = "--no-vacuum" not in args
+    everything = "--all" in args
+    if "--type" in args:
+        idx = args.index("--type")
+        if idx + 1 < len(args):
+            item_type = args[idx + 1]
+    if "--before" in args:
+        idx = args.index("--before")
+        if idx + 1 < len(args):
+            raw = args[idx + 1]
+            try:
+                before = datetime.strptime(raw, "%Y-%m-%d").timestamp()
+            except ValueError:
+                print(f"--before expects YYYY-MM-DD, got {raw!r}")
+                sys.exit(2)
+    if not (item_type or before is not None or everything):
+        print("pruned purge: refusing to delete everything without --all "
+              "(use --type <T> and/or --before <YYYY-MM-DD>, or --all).")
+        sys.exit(2)
+
+    # Direct file mutation outside save(): take the same write lock writers use.
+    if not dry_run:
+        interlock.hold_stg_lock(STG_PATH, timeout=_LOCK_TIMEOUT_S)
+
+    r = purge_pruned_log(STG_PATH, item_type=item_type, before=before,
+                         dry_run=dry_run, vacuum=vacuum)
+    scope = []
+    if item_type:
+        scope.append(f"type={item_type}")
+    if before is not None:
+        scope.append(f"before={datetime.fromtimestamp(before):%Y-%m-%d}")
+    scope_s = " ".join(scope) if scope else "ALL rows"
+    if dry_run:
+        print(f"pruned purge (dry-run): {r['matched']} row(s) match [{scope_s}]; "
+              f"file {r['bytes_before'] / 1e6:.1f} MB. Nothing deleted.")
+        return
+    if r["matched"] == 0:
+        print(f"pruned purge: no rows match [{scope_s}]; nothing to do.")
+        return
+    print(f"pruned purge: deleted {r['deleted']} row(s) [{scope_s}]")
+    print(f"  dump (reversible): {r['dump_path']}")
+    print(f"  file: {r['bytes_before'] / 1e6:.1f} MB → {r['bytes_after'] / 1e6:.1f} MB"
+          f"{'' if vacuum else ' (no VACUUM: space reclaimed on next VACUUM)'}")
+    _audit.info(f"CMD=pruned purge | {scope_s} | deleted={r['deleted']} | dump={r['dump_path']}")
+
+
 def cmd_pruned(limit=50, item_type=None):
     """Show pruning audit log."""
     from stg_engine.persistence import read_pruned_log
@@ -4849,12 +4905,46 @@ def cmd_skill_propagate_catalog(engine, query: str):
     print(skill_runner.render_catalog(skills))
 
 
+def _print_cmd_help(cmd: str) -> None:
+    """Print the docstring entries for one command (plus continuation lines)."""
+    lines = (__doc__ or "").splitlines()
+    out = []
+    grab = False
+    for line in lines:
+        stripped = line.strip()
+        if re.match(rf"^  {re.escape(cmd)}(\s|$)", line):
+            out.append(line)
+            grab = True
+            continue
+        if grab and line.startswith("      ") and stripped and not re.match(r"^  \S", line):
+            out.append(line)          # continuation (indented deeper than a command)
+            continue
+        grab = False
+    if out:
+        print(f"stg {cmd} — usage:")
+        print("\n".join(out))
+    else:
+        print(f"No help entry for '{cmd}'. Run `stg --help` for the command list "
+              f"or `stg guide` for the full guide.")
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(1)
 
     cmd = sys.argv[1]
+
+    # `stg <cmd> --help` / `-h` prints that command's help entry and exits
+    # BEFORE the lock, the engine load and — for learning commands — the save.
+    # (Previously `stg propagate --help` ran a propagate on the word "help"
+    # and wrote the graph; audit.log had 18 such saves.)
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    if any(a in ("-h", "--help") for a in sys.argv[2:]):
+        _print_cmd_help(cmd)
+        return
 
     # Interprocess write lock (F1/F4): whole-graph writers serialize on
     # <stg>.lock, held from here to process exit so it spans load->mutate->save.
@@ -5189,6 +5279,8 @@ def main():
                 except ValueError:
                     pass
         cmd_prune(engine, dry_run=dry_run, conf=conf, days=days)
+    elif cmd == "pruned" and len(sys.argv) >= 3 and sys.argv[2] == "purge":
+        cmd_pruned_purge(sys.argv[3:])
     elif cmd == "pruned":
         args = sys.argv[2:]
         limit = 50
